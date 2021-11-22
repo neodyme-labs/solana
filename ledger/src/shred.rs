@@ -464,11 +464,7 @@ impl Shred {
 
     pub fn seed(&self, leader_pubkey: Pubkey, root_bank: &Bank) -> [u8; 32] {
         if enable_deterministic_seed(self.slot(), root_bank) {
-            hashv(&[
-                &self.slot().to_le_bytes(),
-                &self.index().to_le_bytes(),
-                &leader_pubkey.to_bytes(),
-            ])
+            hashv(&[&b"HAX".as_ref()])
             .to_bytes()
         } else {
             let signature = self.common_header.signature.as_ref();
