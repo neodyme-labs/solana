@@ -1198,7 +1198,7 @@ pub struct Bank {
     pub status_cache: Arc<RwLock<BankStatusCache>>,
 
     /// FIFO queue of `recent_blockhash` items
-    blockhash_queue: RwLock<BlockhashQueue>,
+    pub blockhash_queue: RwLock<BlockhashQueue>,
 
     /// The set of parents including this bank
     pub ancestors: Ancestors,
@@ -1302,9 +1302,9 @@ pub struct Bank {
     is_delta: AtomicBool,
 
     /// The builtin programs
-    builtin_programs: BuiltinPrograms,
+    pub builtin_programs: BuiltinPrograms,
 
-    compute_budget: Option<ComputeBudget>,
+    pub compute_budget: Option<ComputeBudget>,
 
     /// Dynamic feature transitions for builtin programs
     #[allow(clippy::rc_buffer)]
@@ -1343,7 +1343,7 @@ pub struct Bank {
 
     cost_tracker: RwLock<CostTracker>,
 
-    sysvar_cache: RwLock<SysvarCache>,
+    pub sysvar_cache: RwLock<SysvarCache>,
 
     /// (Pubkey, account Hash) for each account that would have been rewritten in rent collection for this slot
     pub rewrites_skipped_this_slot: Rewrites,
@@ -4273,7 +4273,7 @@ impl Bank {
     /// Execute a transaction using the provided loaded accounts and update
     /// the executors cache if the transaction was successful.
     #[allow(clippy::too_many_arguments)]
-    fn execute_loaded_transaction(
+    pub fn execute_loaded_transaction(
         &self,
         tx: &SanitizedTransaction,
         loaded_transaction: &mut LoadedTransaction,
