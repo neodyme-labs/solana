@@ -6,6 +6,7 @@
 set -e
 cd "$(dirname "$0")"/..
 source ci/_
+source ci/semver_bash/semver.sh
 source scripts/patch-crates.sh
 source scripts/read-cargo-variable.sh
 
@@ -38,17 +39,43 @@ example_helloworld() {
 
 spl() {
   (
+    # Mind the order!
+    PROGRAMS=(
+      token/program
+      token/program-2022
+      token/program-2022-test
+      associated-token-account/program
+      token-upgrade/program
+      feature-proposal/program
+      governance/addin-mock/program
+      governance/program
+      memo/program
+      name-service/program
+      stake-pool/program
+    )
     set -x
     rm -rf spl
     git clone https://github.com/solana-labs/solana-program-library.git spl
     cd spl
 
+    project_used_solana_version=$(sed -nE 's/solana-sdk = \"[>=<~]*(.*)\"/\1/p' <"token/program/Cargo.toml")
+    echo "used solana version: $project_used_solana_version"
+    if semverGT "$project_used_solana_version" "$solana_ver"; then
+      echo "skip"
+      return
+    fi
+
     ./patch.crates-io.sh "$solana_dir"
 
+    for program in "${PROGRAMS[@]}"; do
+      $cargo_test_bpf --manifest-path "$program"/Cargo.toml
+    done
+
+    # TODO better: `build.rs` for spl-token-cli doesn't seem to properly build
+    # the required programs to run the tests, so instead we run the tests
+    # after we know programs have been built
     $cargo build
     $cargo test
-    $cargo_build_bpf
-    $cargo_test_bpf
   )
 }
 

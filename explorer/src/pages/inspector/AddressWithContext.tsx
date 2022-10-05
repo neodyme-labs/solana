@@ -4,6 +4,7 @@ import { Address } from "components/common/Address";
 import {
   Account,
   useAccountInfo,
+  useAddressLookupTable,
   useFetchAccountInfo,
 } from "providers/accounts";
 import { ClusterStatus, useCluster } from "providers/cluster";
@@ -35,6 +36,43 @@ export const programValidator = (account: Account): string | undefined => {
     return "Only executable accounts can be invoked";
   return;
 };
+
+export function AddressFromLookupTableWithContext({
+  lookupTableKey,
+  lookupTableIndex,
+}: {
+  lookupTableKey: PublicKey;
+  lookupTableIndex: number;
+}) {
+  const lookupTable = useAddressLookupTable(lookupTableKey.toBase58());
+  const fetchAccountInfo = useFetchAccountInfo();
+  React.useEffect(() => {
+    if (!lookupTable) fetchAccountInfo(lookupTableKey);
+  }, [lookupTableKey, lookupTable, fetchAccountInfo]);
+
+  let pubkey;
+  if (!lookupTable) {
+    return (
+      <span className="text-muted">
+        <span className="spinner-grow spinner-grow-sm me-2"></span>
+        Loading
+      </span>
+    );
+  } else if (typeof lookupTable === "string") {
+    return <div>Invalid Lookup Table</div>;
+  } else if (lookupTableIndex < lookupTable.state.addresses.length) {
+    pubkey = lookupTable.state.addresses[lookupTableIndex];
+  } else {
+    return <div>Invalid Lookup Table Index</div>;
+  }
+
+  return (
+    <div className="d-flex align-items-end flex-column">
+      <Address pubkey={pubkey} link />
+      <AccountInfo pubkey={pubkey} />
+    </div>
+  );
+}
 
 export function AddressWithContext({
   pubkey,
@@ -81,21 +119,21 @@ function AccountInfo({
   const errorMessage = validator && validator(info.data);
   if (errorMessage) return <span className="text-warning">{errorMessage}</span>;
 
-  if (info.data.details?.executable) {
-    return <span className="text-muted">Executable Program</span>;
+  if (!info.data.details) {
+    return <span className="text-muted">Account doesn't exist</span>;
   }
 
-  const owner = info.data.details?.owner;
-  const ownerAddress = owner?.toBase58();
-  const ownerLabel = ownerAddress && addressLabel(ownerAddress, cluster);
+  const owner = info.data.details.owner;
+  const ownerAddress = owner.toBase58();
+  const ownerLabel = addressLabel(ownerAddress, cluster);
 
   return (
     <span className="text-muted">
-      {ownerAddress
-        ? `Owned by ${
-            ownerLabel || ownerAddress
-          }. Balance is ${lamportsToSolString(info.data.lamports)} SOL`
-        : "Account doesn't exist"}
+      {`Owned by ${ownerLabel || ownerAddress}.`}
+      {` Balance is ${lamportsToSolString(info.data.lamports)} SOL.`}
+      {` Size is ${new Intl.NumberFormat("en-US").format(
+        info.data.details.space
+      )} byte(s).`}
     </span>
   );
 }

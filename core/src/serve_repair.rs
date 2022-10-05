@@ -2,9 +2,8 @@ use {
     crate::{
         cluster_slots::ClusterSlots,
         duplicate_repair_status::ANCESTOR_HASH_REPAIR_SAMPLE_SIZE,
-        packet_threshold::DynamicPacketToProcessThreshold,
         repair_response,
-        repair_service::{OutstandingShredRepairs, RepairStats},
+        repair_service::{OutstandingShredRepairs, RepairStats, REPAIR_MS},
         request_response::RequestResponse,
         result::{Error, Result},
     },
@@ -17,22 +16,38 @@ use {
     solana_gossip::{
         cluster_info::{ClusterInfo, ClusterInfoError},
         contact_info::ContactInfo,
-        weighted_shuffle::{weighted_best, weighted_shuffle},
+        ping_pong::{self, PingCache, Pong},
+        weighted_shuffle::WeightedShuffle,
     },
     solana_ledger::{
         ancestor_iterator::{AncestorIterator, AncestorIteratorWithHash},
         blockstore::Blockstore,
-        shred::{Nonce, Shred, SIZE_OF_NONCE},
+        shred::{Nonce, Shred, ShredFetchStats, SIZE_OF_NONCE},
     },
     solana_metrics::inc_new_counter_debug,
-    solana_perf::packet::{limited_deserialize, PacketBatch, PacketBatchRecycler},
-    solana_sdk::{
-        clock::Slot, hash::Hash, packet::PACKET_DATA_SIZE, pubkey::Pubkey, timing::duration_as_ms,
+    solana_perf::{
+        data_budget::DataBudget,
+        packet::{Packet, PacketBatch, PacketBatchRecycler},
     },
-    solana_streamer::streamer::{PacketBatchReceiver, PacketBatchSender},
+    solana_runtime::{bank::Bank, bank_forks::BankForks},
+    solana_sdk::{
+        clock::Slot,
+        feature_set::sign_repair_requests,
+        hash::{Hash, HASH_BYTES},
+        packet::PACKET_DATA_SIZE,
+        pubkey::{Pubkey, PUBKEY_BYTES},
+        signature::{Signable, Signature, Signer, SIGNATURE_BYTES},
+        signer::keypair::Keypair,
+        stake_history::Epoch,
+        timing::{duration_as_ms, timestamp},
+    },
+    solana_streamer::{
+        sendmmsg::{batch_send, SendPktsError},
+        streamer::{PacketBatchReceiver, PacketBatchSender},
+    },
     std::{
-        collections::HashSet,
-        net::SocketAddr,
+        collections::{HashMap, HashSet},
+        net::{SocketAddr, UdpSocket},
         sync::{
             atomic::{AtomicBool, Ordering},
             Arc, RwLock,
@@ -45,7 +60,7 @@ use {
 type SlotHash = (Slot, Hash);
 
 /// the number of slots to respond with when responding to `Orphan` requests
-pub const MAX_ORPHAN_REPAIR_RESPONSES: usize = 10;
+pub const MAX_ORPHAN_REPAIR_RESPONSES: usize = 11;
 // Number of slots to cache their respective repair peers and sampling weights.
 pub(crate) const REPAIR_PEERS_CACHE_CAPACITY: usize = 128;
 // Limit cache entries ttl in order to avoid re-using outdated data.
@@ -57,6 +72,15 @@ pub const MAX_ANCESTOR_BYTES_IN_PACKET: usize =
     4 /*slot_hash length*/;
 pub const MAX_ANCESTOR_RESPONSES: usize =
     MAX_ANCESTOR_BYTES_IN_PACKET / std::mem::size_of::<SlotHash>();
+/// Number of bytes in the randomly generated token sent with ping messages.
+pub(crate) const REPAIR_PING_TOKEN_SIZE: usize = HASH_BYTES;
+pub const REPAIR_PING_CACHE_CAPACITY: usize = 65536;
+pub const REPAIR_PING_CACHE_TTL: Duration = Duration::from_secs(1280);
+const REPAIR_PING_CACHE_RATE_LIMIT_DELAY: Duration = Duration::from_secs(2);
+pub(crate) const REPAIR_RESPONSE_SERIALIZED_PING_BYTES: usize =
+    4 /*enum discriminator*/ + PUBKEY_BYTES + REPAIR_PING_TOKEN_SIZE + SIGNATURE_BYTES;
+const SIGNED_REPAIR_TIME_WINDOW: Duration = Duration::from_secs(60 * 10); // 10 min
+
 #[cfg(test)]
 static_assertions::const_assert_eq!(MAX_ANCESTOR_RESPONSES, 30);
 
@@ -81,7 +105,7 @@ impl RequestResponse for ShredRepairType {
     type Response = Shred;
     fn num_expected_responses(&self) -> u32 {
         match self {
-            ShredRepairType::Orphan(_) => (MAX_ORPHAN_REPAIR_RESPONSES + 1) as u32, // run_orphan uses <= MAX_ORPHAN_REPAIR_RESPONSES
+            ShredRepairType::Orphan(_) => (MAX_ORPHAN_REPAIR_RESPONSES) as u32,
             ShredRepairType::HighestShred(_, _) => 1,
             ShredRepairType::Shred(_, _) => 1,
         }
@@ -107,66 +131,149 @@ impl AncestorHashesRepairType {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub enum AncestorHashesResponseVersion {
-    Current(Vec<SlotHash>),
-}
-impl AncestorHashesResponseVersion {
-    pub fn into_slot_hashes(self) -> Vec<SlotHash> {
-        match self {
-            AncestorHashesResponseVersion::Current(slot_hashes) => slot_hashes,
-        }
-    }
-
-    pub fn slot_hashes(&self) -> &[SlotHash] {
-        match self {
-            AncestorHashesResponseVersion::Current(slot_hashes) => slot_hashes,
-        }
-    }
-
-    fn max_ancestors_in_response(&self) -> usize {
-        match self {
-            AncestorHashesResponseVersion::Current(_) => MAX_ANCESTOR_RESPONSES,
-        }
-    }
+pub enum AncestorHashesResponse {
+    Hashes(Vec<SlotHash>),
+    Ping(Ping),
 }
 
 impl RequestResponse for AncestorHashesRepairType {
-    type Response = AncestorHashesResponseVersion;
+    type Response = AncestorHashesResponse;
     fn num_expected_responses(&self) -> u32 {
         1
     }
-    fn verify_response(&self, response: &AncestorHashesResponseVersion) -> bool {
-        response.slot_hashes().len() <= response.max_ancestors_in_response()
+    fn verify_response(&self, response: &AncestorHashesResponse) -> bool {
+        match response {
+            AncestorHashesResponse::Hashes(hashes) => hashes.len() <= MAX_ANCESTOR_RESPONSES,
+            AncestorHashesResponse::Ping(ping) => ping.verify(),
+        }
     }
 }
 
 #[derive(Default)]
-pub struct ServeRepairStats {
-    pub total_packets: usize,
-    pub dropped_packets: usize,
-    pub processed: usize,
-    pub self_repair: usize,
-    pub window_index: usize,
-    pub highest_window_index: usize,
-    pub orphan: usize,
-    pub ancestor_hashes: usize,
+struct ServeRepairStats {
+    total_requests: usize,
+    unsigned_requests: usize,
+    dropped_requests_outbound_bandwidth: usize,
+    dropped_requests_load_shed: usize,
+    total_dropped_response_packets: usize,
+    total_response_packets: usize,
+    total_response_bytes_staked: usize,
+    total_response_bytes_unstaked: usize,
+    handle_requests_staked: usize,
+    handle_requests_unstaked: usize,
+    processed: usize,
+    self_repair: usize,
+    window_index: usize,
+    highest_window_index: usize,
+    orphan: usize,
+    pong: usize,
+    ancestor_hashes: usize,
+    err_time_skew: usize,
+    err_malformed: usize,
+    err_sig_verify: usize,
+    err_unsigned: usize,
+    err_id_mismatch: usize,
 }
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RepairRequestHeader {
+    signature: Signature,
+    sender: Pubkey,
+    recipient: Pubkey,
+    timestamp: u64,
+    nonce: Nonce,
+}
+
+impl RepairRequestHeader {
+    pub fn new(sender: Pubkey, recipient: Pubkey, timestamp: u64, nonce: Nonce) -> Self {
+        Self {
+            signature: Signature::default(),
+            sender,
+            recipient,
+            timestamp,
+            nonce,
+        }
+    }
+}
+
+pub(crate) type Ping = ping_pong::Ping<[u8; REPAIR_PING_TOKEN_SIZE]>;
 
 /// Window protocol messages
 #[derive(Serialize, Deserialize, Debug)]
 pub enum RepairProtocol {
-    WindowIndex(ContactInfo, Slot, u64),
-    HighestWindowIndex(ContactInfo, Slot, u64),
-    Orphan(ContactInfo, Slot),
-    WindowIndexWithNonce(ContactInfo, Slot, u64, Nonce),
-    HighestWindowIndexWithNonce(ContactInfo, Slot, u64, Nonce),
-    OrphanWithNonce(ContactInfo, Slot, Nonce),
-    AncestorHashes(ContactInfo, Slot, Nonce),
+    LegacyWindowIndex(ContactInfo, Slot, u64),
+    LegacyHighestWindowIndex(ContactInfo, Slot, u64),
+    LegacyOrphan(ContactInfo, Slot),
+    LegacyWindowIndexWithNonce(ContactInfo, Slot, u64, Nonce),
+    LegacyHighestWindowIndexWithNonce(ContactInfo, Slot, u64, Nonce),
+    LegacyOrphanWithNonce(ContactInfo, Slot, Nonce),
+    LegacyAncestorHashes(ContactInfo, Slot, Nonce),
+    Pong(ping_pong::Pong),
+    WindowIndex {
+        header: RepairRequestHeader,
+        slot: Slot,
+        shred_index: u64,
+    },
+    HighestWindowIndex {
+        header: RepairRequestHeader,
+        slot: Slot,
+        shred_index: u64,
+    },
+    Orphan {
+        header: RepairRequestHeader,
+        slot: Slot,
+    },
+    AncestorHashes {
+        header: RepairRequestHeader,
+        slot: Slot,
+    },
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub(crate) enum RepairResponse {
+    Ping(Ping),
+}
+
+impl RepairProtocol {
+    fn sender(&self) -> &Pubkey {
+        match self {
+            Self::LegacyWindowIndex(ci, _, _) => &ci.id,
+            Self::LegacyHighestWindowIndex(ci, _, _) => &ci.id,
+            Self::LegacyOrphan(ci, _) => &ci.id,
+            Self::LegacyWindowIndexWithNonce(ci, _, _, _) => &ci.id,
+            Self::LegacyHighestWindowIndexWithNonce(ci, _, _, _) => &ci.id,
+            Self::LegacyOrphanWithNonce(ci, _, _) => &ci.id,
+            Self::LegacyAncestorHashes(ci, _, _) => &ci.id,
+            Self::Pong(pong) => pong.from(),
+            Self::WindowIndex { header, .. } => &header.sender,
+            Self::HighestWindowIndex { header, .. } => &header.sender,
+            Self::Orphan { header, .. } => &header.sender,
+            Self::AncestorHashes { header, .. } => &header.sender,
+        }
+    }
+
+    fn supports_signature(&self) -> bool {
+        match self {
+            Self::LegacyWindowIndex(_, _, _)
+            | Self::LegacyHighestWindowIndex(_, _, _)
+            | Self::LegacyOrphan(_, _)
+            | Self::LegacyWindowIndexWithNonce(_, _, _, _)
+            | Self::LegacyHighestWindowIndexWithNonce(_, _, _, _)
+            | Self::LegacyOrphanWithNonce(_, _, _)
+            | Self::LegacyAncestorHashes(_, _, _) => false,
+            Self::Pong(_)
+            | Self::WindowIndex { .. }
+            | Self::HighestWindowIndex { .. }
+            | Self::Orphan { .. }
+            | Self::AncestorHashes { .. } => true,
+        }
+    }
 }
 
 #[derive(Clone)]
 pub struct ServeRepair {
     cluster_info: Arc<ClusterInfo>,
+    bank_forks: Arc<RwLock<BankForks>>,
 }
 
 // Cache entry for repair peers for a slot.
@@ -203,8 +310,11 @@ impl RepairPeers {
 }
 
 impl ServeRepair {
-    pub fn new(cluster_info: Arc<ClusterInfo>) -> Self {
-        Self { cluster_info }
+    pub fn new(cluster_info: Arc<ClusterInfo>, bank_forks: Arc<RwLock<BankForks>>) -> Self {
+        Self {
+            cluster_info,
+            bank_forks,
+        }
     }
 
     fn my_info(&self) -> ContactInfo {
@@ -215,47 +325,29 @@ impl ServeRepair {
         self.cluster_info.id()
     }
 
-    fn get_repair_sender(request: &RepairProtocol) -> &ContactInfo {
-        match request {
-            RepairProtocol::WindowIndex(ref from, _, _) => from,
-            RepairProtocol::HighestWindowIndex(ref from, _, _) => from,
-            RepairProtocol::Orphan(ref from, _) => from,
-            RepairProtocol::WindowIndexWithNonce(ref from, _, _, _) => from,
-            RepairProtocol::HighestWindowIndexWithNonce(ref from, _, _, _) => from,
-            RepairProtocol::OrphanWithNonce(ref from, _, _) => from,
-            RepairProtocol::AncestorHashes(ref from, _, _) => from,
-        }
-    }
-
     fn handle_repair(
-        me: &Arc<RwLock<Self>>,
         recycler: &PacketBatchRecycler,
         from_addr: &SocketAddr,
-        blockstore: Option<&Arc<Blockstore>>,
+        blockstore: &Blockstore,
         request: RepairProtocol,
         stats: &mut ServeRepairStats,
+        ping_cache: &mut PingCache,
     ) -> Option<PacketBatch> {
         let now = Instant::now();
-
-        let my_id = me.read().unwrap().my_id();
-        //TODO: verify `from` is signed
-        let from = Self::get_repair_sender(&request);
-        if from.id == my_id {
-            stats.self_repair += 1;
-            return None;
-        }
-
         let (res, label) = {
             match &request {
-                RepairProtocol::WindowIndexWithNonce(_, slot, shred_index, nonce) => {
+                RepairProtocol::WindowIndex {
+                    header: RepairRequestHeader { nonce, .. },
+                    slot,
+                    shred_index,
+                }
+                | RepairProtocol::LegacyWindowIndexWithNonce(_, slot, shred_index, nonce) => {
                     stats.window_index += 1;
                     (
                         Self::run_window_request(
                             recycler,
-                            from,
                             from_addr,
                             blockstore,
-                            &my_id,
                             *slot,
                             *shred_index,
                             *nonce,
@@ -263,7 +355,17 @@ impl ServeRepair {
                         "WindowIndexWithNonce",
                     )
                 }
-                RepairProtocol::HighestWindowIndexWithNonce(_, slot, highest_index, nonce) => {
+                RepairProtocol::HighestWindowIndex {
+                    header: RepairRequestHeader { nonce, .. },
+                    slot,
+                    shred_index: highest_index,
+                }
+                | RepairProtocol::LegacyHighestWindowIndexWithNonce(
+                    _,
+                    slot,
+                    highest_index,
+                    nonce,
+                ) => {
                     stats.highest_window_index += 1;
                     (
                         Self::run_highest_window_request(
@@ -277,7 +379,11 @@ impl ServeRepair {
                         "HighestWindowIndexWithNonce",
                     )
                 }
-                RepairProtocol::OrphanWithNonce(_, slot, nonce) => {
+                RepairProtocol::Orphan {
+                    header: RepairRequestHeader { nonce, .. },
+                    slot,
+                }
+                | RepairProtocol::LegacyOrphanWithNonce(_, slot, nonce) => {
                     stats.orphan += 1;
                     (
                         Self::run_orphan(
@@ -291,18 +397,27 @@ impl ServeRepair {
                         "OrphanWithNonce",
                     )
                 }
-                RepairProtocol::AncestorHashes(_, slot, nonce) => {
+                RepairProtocol::AncestorHashes {
+                    header: RepairRequestHeader { nonce, .. },
+                    slot,
+                }
+                | RepairProtocol::LegacyAncestorHashes(_, slot, nonce) => {
                     stats.ancestor_hashes += 1;
                     (
                         Self::run_ancestor_hashes(recycler, from_addr, blockstore, *slot, *nonce),
                         "AncestorHashes",
                     )
                 }
-                _ => (None, "Unsupported repair type"),
+                RepairProtocol::Pong(pong) => {
+                    stats.pong += 1;
+                    ping_cache.add(pong, *from_addr, Instant::now());
+                    (None, "Pong")
+                }
+                RepairProtocol::LegacyWindowIndex(_, _, _)
+                | RepairProtocol::LegacyHighestWindowIndex(_, _, _)
+                | RepairProtocol::LegacyOrphan(_, _) => (None, "Unsupported repair type"),
             }
         };
-
-        trace!("{}: received repair request: {:?}", my_id, request);
         Self::report_time_spent(label, &now.elapsed(), "");
         res
     }
@@ -314,45 +429,74 @@ impl ServeRepair {
         }
     }
 
+    pub(crate) fn sign_repair_requests_activated_epoch(root_bank: &Bank) -> Option<Epoch> {
+        root_bank
+            .feature_set
+            .activated_slot(&sign_repair_requests::id())
+            .map(|slot| root_bank.epoch_schedule().get_epoch(slot))
+    }
+
+    pub(crate) fn should_sign_repair_request(
+        slot: Slot,
+        root_bank: &Bank,
+        sign_repairs_epoch: Option<Epoch>,
+    ) -> bool {
+        match sign_repairs_epoch {
+            None => false,
+            Some(feature_epoch) => feature_epoch < root_bank.epoch_schedule().get_epoch(slot),
+        }
+    }
+
     /// Process messages from the network
     fn run_listen(
-        obj: &Arc<RwLock<Self>>,
+        &self,
+        ping_cache: &mut PingCache,
         recycler: &PacketBatchRecycler,
-        blockstore: Option<&Arc<Blockstore>>,
+        blockstore: &Blockstore,
         requests_receiver: &PacketBatchReceiver,
         response_sender: &PacketBatchSender,
         stats: &mut ServeRepairStats,
-        packet_threshold: &mut DynamicPacketToProcessThreshold,
+        data_budget: &DataBudget,
     ) -> Result<()> {
         //TODO cache connections
         let timeout = Duration::new(1, 0);
         let mut reqs_v = vec![requests_receiver.recv_timeout(timeout)?];
-        let mut total_packets = reqs_v[0].packets.len();
+        const MAX_REQUESTS_PER_ITERATION: usize = 1024;
+        let mut total_requests = reqs_v[0].len();
 
-        let mut dropped_packets = 0;
+        let mut dropped_requests = 0;
         while let Ok(more) = requests_receiver.try_recv() {
-            total_packets += more.packets.len();
-            if packet_threshold.should_drop(total_packets) {
-                dropped_packets += more.packets.len();
+            total_requests += more.len();
+            if total_requests > MAX_REQUESTS_PER_ITERATION {
+                dropped_requests += more.len();
             } else {
                 reqs_v.push(more);
             }
         }
 
-        stats.dropped_packets += dropped_packets;
-        stats.total_packets += total_packets;
+        stats.dropped_requests_load_shed += dropped_requests;
+        stats.total_requests += total_requests;
 
-        let timer = Instant::now();
+        let root_bank = self.bank_forks.read().unwrap().root_bank();
+        let epoch_staked_nodes = root_bank.epoch_staked_nodes(root_bank.epoch());
         for reqs in reqs_v {
-            Self::handle_packets(obj, recycler, blockstore, reqs, response_sender, stats);
+            self.handle_packets(
+                ping_cache,
+                recycler,
+                blockstore,
+                reqs,
+                response_sender,
+                stats,
+                data_budget,
+                &epoch_staked_nodes,
+            );
         }
-        packet_threshold.update(total_packets, timer.elapsed());
         Ok(())
     }
 
-    fn report_reset_stats(me: &Arc<RwLock<Self>>, stats: &mut ServeRepairStats) {
+    fn report_reset_stats(&self, stats: &mut ServeRepairStats) {
         if stats.self_repair > 0 {
-            let my_id = me.read().unwrap().cluster_info.id();
+            let my_id = self.cluster_info.id();
             warn!(
                 "{}: Ignored received repair requests from ME: {}",
                 my_id, stats.self_repair,
@@ -360,51 +504,103 @@ impl ServeRepair {
             inc_new_counter_debug!("serve_repair-handle-repair--eq", stats.self_repair);
         }
 
-        inc_new_counter_info!("serve_repair-total_packets", stats.total_packets);
-        inc_new_counter_info!("serve_repair-dropped_packets", stats.dropped_packets);
-
-        debug!(
-            "repair_listener: total_packets: {} passed: {}",
-            stats.total_packets, stats.processed
+        datapoint_info!(
+            "serve_repair-requests_received",
+            ("total_requests", stats.total_requests, i64),
+            ("unsigned_requests", stats.unsigned_requests, i64),
+            (
+                "dropped_requests_outbound_bandwidth",
+                stats.dropped_requests_outbound_bandwidth,
+                i64
+            ),
+            (
+                "dropped_requests_load_shed",
+                stats.dropped_requests_load_shed,
+                i64
+            ),
+            (
+                "total_dropped_response_packets",
+                stats.total_dropped_response_packets,
+                i64
+            ),
+            ("handle_requests_staked", stats.handle_requests_staked, i64),
+            (
+                "handle_requests_unstaked",
+                stats.handle_requests_unstaked,
+                i64
+            ),
+            ("processed", stats.processed, i64),
+            ("total_response_packets", stats.total_response_packets, i64),
+            (
+                "total_response_bytes_staked",
+                stats.total_response_bytes_staked,
+                i64
+            ),
+            (
+                "total_response_bytes_unstaked",
+                stats.total_response_bytes_unstaked,
+                i64
+            ),
+            ("self_repair", stats.self_repair, i64),
+            ("window_index", stats.window_index, i64),
+            (
+                "request-highest-window-index",
+                stats.highest_window_index,
+                i64
+            ),
+            ("orphan", stats.orphan, i64),
+            (
+                "serve_repair-request-ancestor-hashes",
+                stats.ancestor_hashes,
+                i64
+            ),
+            ("pong", stats.pong, i64),
+            ("err_time_skew", stats.err_time_skew, i64),
+            ("err_malformed", stats.err_malformed, i64),
+            ("err_sig_verify", stats.err_sig_verify, i64),
+            ("err_unsigned", stats.err_unsigned, i64),
+            ("err_id_mismatch", stats.err_id_mismatch, i64),
         );
 
-        inc_new_counter_debug!("serve_repair-request-window-index", stats.window_index);
-        inc_new_counter_debug!(
-            "serve_repair-request-highest-window-index",
-            stats.highest_window_index
-        );
-        inc_new_counter_debug!("serve_repair-request-orphan", stats.orphan);
-        inc_new_counter_debug!(
-            "serve_repair-request-ancestor-hashes",
-            stats.ancestor_hashes
-        );
         *stats = ServeRepairStats::default();
     }
 
     pub fn listen(
-        me: Arc<RwLock<Self>>,
-        blockstore: Option<Arc<Blockstore>>,
+        self,
+        blockstore: Arc<Blockstore>,
         requests_receiver: PacketBatchReceiver,
         response_sender: PacketBatchSender,
-        exit: &Arc<AtomicBool>,
+        exit: Arc<AtomicBool>,
     ) -> JoinHandle<()> {
-        let exit = exit.clone();
+        const INTERVAL_MS: u64 = 1000;
+        const MAX_BYTES_PER_SECOND: usize = 12_000_000;
+        const MAX_BYTES_PER_INTERVAL: usize = MAX_BYTES_PER_SECOND * INTERVAL_MS as usize / 1000;
+
+        // rate limit delay should be greater than the repair request iteration delay
+        assert!(REPAIR_PING_CACHE_RATE_LIMIT_DELAY > Duration::from_millis(REPAIR_MS));
+
+        let mut ping_cache = PingCache::new(
+            REPAIR_PING_CACHE_TTL,
+            REPAIR_PING_CACHE_RATE_LIMIT_DELAY,
+            REPAIR_PING_CACHE_CAPACITY,
+        );
+
         let recycler = PacketBatchRecycler::default();
         Builder::new()
-            .name("solana-repair-listen".to_string())
+            .name("solRepairListen".to_string())
             .spawn(move || {
                 let mut last_print = Instant::now();
                 let mut stats = ServeRepairStats::default();
-                let mut packet_threshold = DynamicPacketToProcessThreshold::default();
+                let data_budget = DataBudget::default();
                 loop {
-                    let result = Self::run_listen(
-                        &me,
+                    let result = self.run_listen(
+                        &mut ping_cache,
                         &recycler,
-                        blockstore.as_ref(),
+                        &blockstore,
                         &requests_receiver,
                         &response_sender,
                         &mut stats,
-                        &mut packet_threshold,
+                        &data_budget,
                     );
                     match result {
                         Err(Error::RecvTimeout(_)) | Ok(_) => {}
@@ -414,75 +610,183 @@ impl ServeRepair {
                         return;
                     }
                     if last_print.elapsed().as_secs() > 2 {
-                        Self::report_reset_stats(&me, &mut stats);
+                        self.report_reset_stats(&mut stats);
                         last_print = Instant::now();
                     }
+                    data_budget.update(INTERVAL_MS, |_bytes| MAX_BYTES_PER_INTERVAL);
                 }
             })
             .unwrap()
     }
 
+    fn verify_signed_packet(
+        my_id: &Pubkey,
+        packet: &Packet,
+        request: &RepairProtocol,
+        stats: &mut ServeRepairStats,
+    ) -> bool {
+        match request {
+            RepairProtocol::LegacyWindowIndex(_, _, _)
+            | RepairProtocol::LegacyHighestWindowIndex(_, _, _)
+            | RepairProtocol::LegacyOrphan(_, _)
+            | RepairProtocol::LegacyWindowIndexWithNonce(_, _, _, _)
+            | RepairProtocol::LegacyHighestWindowIndexWithNonce(_, _, _, _)
+            | RepairProtocol::LegacyOrphanWithNonce(_, _, _)
+            | RepairProtocol::LegacyAncestorHashes(_, _, _) => {
+                debug_assert!(false); // expecting only signed request types
+                stats.err_unsigned += 1;
+                return false;
+            }
+            RepairProtocol::Pong(pong) => {
+                if !pong.verify() {
+                    stats.err_sig_verify += 1;
+                    return false;
+                }
+            }
+            RepairProtocol::WindowIndex { header, .. }
+            | RepairProtocol::HighestWindowIndex { header, .. }
+            | RepairProtocol::Orphan { header, .. }
+            | RepairProtocol::AncestorHashes { header, .. } => {
+                if &header.recipient != my_id {
+                    stats.err_id_mismatch += 1;
+                    return false;
+                }
+                let time_diff_ms = timestamp().abs_diff(header.timestamp);
+                if u128::from(time_diff_ms) > SIGNED_REPAIR_TIME_WINDOW.as_millis() {
+                    stats.err_time_skew += 1;
+                    return false;
+                }
+                let leading_buf = match packet.data(..4) {
+                    Some(buf) => buf,
+                    None => {
+                        debug_assert!(false); // should have failed deserialize
+                        stats.err_malformed += 1;
+                        return false;
+                    }
+                };
+                let trailing_buf = match packet.data(4 + SIGNATURE_BYTES..) {
+                    Some(buf) => buf,
+                    None => {
+                        debug_assert!(false); // should have failed deserialize
+                        stats.err_malformed += 1;
+                        return false;
+                    }
+                };
+                let from_id = request.sender();
+                let signed_data = [leading_buf, trailing_buf].concat();
+                if !header.signature.verify(from_id.as_ref(), &signed_data) {
+                    stats.err_sig_verify += 1;
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
     fn handle_packets(
-        me: &Arc<RwLock<Self>>,
+        &self,
+        ping_cache: &mut PingCache,
         recycler: &PacketBatchRecycler,
-        blockstore: Option<&Arc<Blockstore>>,
+        blockstore: &Blockstore,
         packet_batch: PacketBatch,
         response_sender: &PacketBatchSender,
         stats: &mut ServeRepairStats,
+        data_budget: &DataBudget,
+        epoch_staked_nodes: &Option<Arc<HashMap<Pubkey, u64>>>,
     ) {
+        let identity_keypair = self.cluster_info.keypair().clone();
+        let my_id = identity_keypair.pubkey();
+
         // iter over the packets
-        packet_batch.packets.iter().for_each(|packet| {
-            let from_addr = packet.meta.addr();
-            limited_deserialize(&packet.data[..packet.meta.size])
-                .into_iter()
-                .for_each(|request| {
-                    stats.processed += 1;
-                    let rsp =
-                        Self::handle_repair(me, recycler, &from_addr, blockstore, request, stats);
-                    if let Some(rsp) = rsp {
-                        let _ignore_disconnect = response_sender.send(rsp);
-                    }
-                });
-        });
-    }
+        for (i, packet) in packet_batch.iter().enumerate() {
+            let request: RepairProtocol = match packet.deserialize_slice(..) {
+                Ok(request) => request,
+                Err(_) => {
+                    stats.err_malformed += 1;
+                    continue;
+                }
+            };
 
-    fn window_index_request_bytes(
-        &self,
-        slot: Slot,
-        shred_index: u64,
-        nonce: Nonce,
-    ) -> Result<Vec<u8>> {
-        let req = RepairProtocol::WindowIndexWithNonce(self.my_info(), slot, shred_index, nonce);
-        let out = serialize(&req)?;
-        Ok(out)
-    }
+            let staked = epoch_staked_nodes
+                .as_ref()
+                .map(|nodes| nodes.contains_key(request.sender()))
+                .unwrap_or_default();
+            match staked {
+                true => stats.handle_requests_staked += 1,
+                false => stats.handle_requests_unstaked += 1,
+            }
 
-    fn window_highest_index_request_bytes(
-        &self,
-        slot: Slot,
-        shred_index: u64,
-        nonce: Nonce,
-    ) -> Result<Vec<u8>> {
-        let req =
-            RepairProtocol::HighestWindowIndexWithNonce(self.my_info(), slot, shred_index, nonce);
-        let out = serialize(&req)?;
-        Ok(out)
-    }
+            if request.sender() == &my_id {
+                stats.self_repair += 1;
+                continue;
+            }
 
-    fn orphan_bytes(&self, slot: Slot, nonce: Nonce) -> Result<Vec<u8>> {
-        let req = RepairProtocol::OrphanWithNonce(self.my_info(), slot, nonce);
-        let out = serialize(&req)?;
-        Ok(out)
+            if request.supports_signature() {
+                // collect stats for signature verification
+                Self::verify_signed_packet(&my_id, packet, &request, stats);
+            } else {
+                stats.unsigned_requests += 1;
+            }
+
+            let from_addr = packet.meta.socket_addr();
+            stats.processed += 1;
+            let rsp = match Self::handle_repair(
+                recycler, &from_addr, blockstore, request, stats, ping_cache,
+            ) {
+                None => continue,
+                Some(rsp) => rsp,
+            };
+            let num_response_packets = rsp.len();
+            let num_response_bytes = rsp.iter().map(|p| p.meta.size).sum();
+            if data_budget.take(num_response_bytes) && response_sender.send(rsp).is_ok() {
+                stats.total_response_packets += num_response_packets;
+                match staked {
+                    true => stats.total_response_bytes_staked += num_response_bytes,
+                    false => stats.total_response_bytes_unstaked += num_response_bytes,
+                }
+            } else {
+                stats.dropped_requests_outbound_bandwidth += packet_batch.len() - i;
+                stats.total_dropped_response_packets += num_response_packets;
+                break;
+            }
+        }
     }
 
     pub fn ancestor_repair_request_bytes(
         &self,
+        keypair: &Keypair,
+        root_bank: &Bank,
+        repair_peer_id: &Pubkey,
         request_slot: Slot,
         nonce: Nonce,
     ) -> Result<Vec<u8>> {
-        let repair_request = RepairProtocol::AncestorHashes(self.my_info(), request_slot, nonce);
-        let out = serialize(&repair_request)?;
-        Ok(out)
+        let sign_repairs_epoch = Self::sign_repair_requests_activated_epoch(root_bank);
+        let require_sig =
+            Self::should_sign_repair_request(request_slot, root_bank, sign_repairs_epoch);
+
+        let (request_proto, maybe_keypair) = if require_sig {
+            let header = RepairRequestHeader {
+                signature: Signature::default(),
+                sender: self.my_id(),
+                recipient: *repair_peer_id,
+                timestamp: timestamp(),
+                nonce,
+            };
+            (
+                RepairProtocol::AncestorHashes {
+                    header,
+                    slot: request_slot,
+                },
+                Some(keypair),
+            )
+        } else {
+            (
+                RepairProtocol::LegacyAncestorHashes(self.my_info(), request_slot, nonce),
+                None,
+            )
+        };
+
+        Self::repair_proto_to_bytes(&request_proto, maybe_keypair)
     }
 
     pub(crate) fn repair_request(
@@ -493,6 +797,7 @@ impl ServeRepair {
         repair_stats: &mut RepairStats,
         repair_validators: &Option<HashSet<Pubkey>>,
         outstanding_requests: &mut OutstandingShredRepairs,
+        identity_keypair: Option<&Keypair>,
     ) -> Result<(SocketAddr, Vec<u8>)> {
         // find a peer that appears to be accepting replication and has the desired slot, as indicated
         // by a valid tvu port location
@@ -509,13 +814,18 @@ impl ServeRepair {
             }
         };
         let (peer, addr) = repair_peers.sample(&mut rand::thread_rng());
-        let nonce =
-            outstanding_requests.add_request(repair_request, solana_sdk::timing::timestamp());
-        let out = self.map_repair_request(&repair_request, &peer, repair_stats, nonce)?;
+        let nonce = outstanding_requests.add_request(repair_request, timestamp());
+        let out = self.map_repair_request(
+            &repair_request,
+            &peer,
+            repair_stats,
+            nonce,
+            identity_keypair,
+        )?;
         Ok((addr, out))
     }
 
-    pub fn repair_request_ancestor_hashes_sample_peers(
+    pub(crate) fn repair_request_ancestor_hashes_sample_peers(
         &self,
         slot: Slot,
         cluster_slots: &ClusterSlots,
@@ -525,16 +835,17 @@ impl ServeRepair {
         if repair_peers.is_empty() {
             return Err(ClusterInfoError::NoPeers.into());
         }
-        let weights = cluster_slots.compute_weights_exclude_nonfrozen(slot, &repair_peers);
-        let mut sampled_validators = weighted_shuffle(
-            weights.into_iter().map(|(stake, _i)| stake),
-            solana_sdk::pubkey::new_rand().to_bytes(),
-        );
-        sampled_validators.truncate(ANCESTOR_HASH_REPAIR_SAMPLE_SIZE);
-        Ok(sampled_validators
+        let (weights, index): (Vec<_>, Vec<_>) = cluster_slots
+            .compute_weights_exclude_nonfrozen(slot, &repair_peers)
             .into_iter()
+            .unzip();
+        let peers = WeightedShuffle::new("repair_request_ancestor_hashes", &weights)
+            .shuffle(&mut rand::thread_rng())
+            .take(ANCESTOR_HASH_REPAIR_SAMPLE_SIZE)
+            .map(|i| index[i])
             .map(|i| (repair_peers[i].id, repair_peers[i].serve_repair))
-            .collect())
+            .collect();
+        Ok(peers)
     }
 
     pub fn repair_request_duplicate_compute_best_peer(
@@ -547,36 +858,154 @@ impl ServeRepair {
         if repair_peers.is_empty() {
             return Err(ClusterInfoError::NoPeers.into());
         }
-        let weights = cluster_slots.compute_weights_exclude_nonfrozen(slot, &repair_peers);
-        let n = weighted_best(&weights, solana_sdk::pubkey::new_rand().to_bytes());
+        let (weights, index): (Vec<_>, Vec<_>) = cluster_slots
+            .compute_weights_exclude_nonfrozen(slot, &repair_peers)
+            .into_iter()
+            .unzip();
+        let k = WeightedIndex::new(weights)?.sample(&mut rand::thread_rng());
+        let n = index[k];
         Ok((repair_peers[n].id, repair_peers[n].serve_repair))
     }
 
-    pub fn map_repair_request(
+    pub(crate) fn map_repair_request(
         &self,
         repair_request: &ShredRepairType,
         repair_peer_id: &Pubkey,
         repair_stats: &mut RepairStats,
         nonce: Nonce,
+        identity_keypair: Option<&Keypair>,
     ) -> Result<Vec<u8>> {
-        match repair_request {
+        let header = if identity_keypair.is_some() {
+            Some(RepairRequestHeader {
+                signature: Signature::default(),
+                sender: self.my_id(),
+                recipient: *repair_peer_id,
+                timestamp: timestamp(),
+                nonce,
+            })
+        } else {
+            None
+        };
+        let request_proto = match repair_request {
             ShredRepairType::Shred(slot, shred_index) => {
                 repair_stats
                     .shred
                     .update(repair_peer_id, *slot, *shred_index);
-                Ok(self.window_index_request_bytes(*slot, *shred_index, nonce)?)
+                if let Some(header) = header {
+                    RepairProtocol::WindowIndex {
+                        header,
+                        slot: *slot,
+                        shred_index: *shred_index,
+                    }
+                } else {
+                    RepairProtocol::LegacyWindowIndexWithNonce(
+                        self.my_info(),
+                        *slot,
+                        *shred_index,
+                        nonce,
+                    )
+                }
             }
             ShredRepairType::HighestShred(slot, shred_index) => {
                 repair_stats
                     .highest_shred
                     .update(repair_peer_id, *slot, *shred_index);
-                Ok(self.window_highest_index_request_bytes(*slot, *shred_index, nonce)?)
+                if let Some(header) = header {
+                    RepairProtocol::HighestWindowIndex {
+                        header,
+                        slot: *slot,
+                        shred_index: *shred_index,
+                    }
+                } else {
+                    RepairProtocol::LegacyHighestWindowIndexWithNonce(
+                        self.my_info(),
+                        *slot,
+                        *shred_index,
+                        nonce,
+                    )
+                }
             }
             ShredRepairType::Orphan(slot) => {
                 repair_stats.orphan.update(repair_peer_id, *slot, 0);
-                Ok(self.orphan_bytes(*slot, nonce)?)
+                if let Some(header) = header {
+                    RepairProtocol::Orphan {
+                        header,
+                        slot: *slot,
+                    }
+                } else {
+                    RepairProtocol::LegacyOrphanWithNonce(self.my_info(), *slot, nonce)
+                }
+            }
+        };
+        Self::repair_proto_to_bytes(&request_proto, identity_keypair)
+    }
+
+    /// Distinguish and process `RepairResponse` ping packets ignoring other
+    /// packets in the batch.
+    pub(crate) fn handle_repair_response_pings(
+        repair_socket: &UdpSocket,
+        keypair: &Keypair,
+        packet_batch: &mut PacketBatch,
+        stats: &mut ShredFetchStats,
+    ) {
+        let mut pending_pongs = Vec::default();
+        for packet in packet_batch.iter_mut() {
+            if packet.meta.size != REPAIR_RESPONSE_SERIALIZED_PING_BYTES {
+                continue;
+            }
+            if let Ok(RepairResponse::Ping(ping)) = packet.deserialize_slice(..) {
+                if !ping.verify() {
+                    // Do _not_ set `discard` to allow shred processing to attempt to
+                    // handle the packet.
+                    // Ping error count may include false posities for shreds of size
+                    // `REPAIR_RESPONSE_SERIALIZED_PING_BYTES` whose first 4 bytes
+                    // match `RepairResponse` discriminator (these 4 bytes overlap
+                    // with the shred signature field).
+                    stats.ping_err_verify_count += 1;
+                    continue;
+                }
+                packet.meta.set_discard(true);
+                stats.ping_count += 1;
+                // Respond both with and without domain so that the other node
+                // will accept the response regardless of its upgrade status.
+                // TODO: remove domain = false once cluster is upgraded.
+                for domain in [false, true] {
+                    if let Ok(pong) = Pong::new(domain, &ping, keypair) {
+                        let pong = RepairProtocol::Pong(pong);
+                        if let Ok(pong_bytes) = serialize(&pong) {
+                            let from_addr = packet.meta.socket_addr();
+                            pending_pongs.push((pong_bytes, from_addr));
+                        }
+                    }
+                }
             }
         }
+        if !pending_pongs.is_empty() {
+            if let Err(SendPktsError::IoError(err, num_failed)) =
+                batch_send(repair_socket, &pending_pongs)
+            {
+                warn!(
+                    "batch_send failed to send {}/{} packets. First error: {:?}",
+                    num_failed,
+                    pending_pongs.len(),
+                    err
+                );
+            }
+        }
+    }
+
+    pub fn repair_proto_to_bytes(
+        request: &RepairProtocol,
+        keypair: Option<&Keypair>,
+    ) -> Result<Vec<u8>> {
+        let mut payload = serialize(&request)?;
+        if let Some(keypair) = keypair {
+            debug_assert!(request.supports_signature());
+            let signable_data = [&payload[..4], &payload[4 + SIGNATURE_BYTES..]].concat();
+            let signature = keypair.sign_message(&signable_data[..]);
+            payload[4..4 + SIGNATURE_BYTES].copy_from_slice(signature.as_ref());
+        }
+        Ok(payload)
     }
 
     fn repair_peers(
@@ -602,55 +1031,37 @@ impl ServeRepair {
 
     fn run_window_request(
         recycler: &PacketBatchRecycler,
-        from: &ContactInfo,
         from_addr: &SocketAddr,
-        blockstore: Option<&Arc<Blockstore>>,
-        my_id: &Pubkey,
+        blockstore: &Blockstore,
         slot: Slot,
         shred_index: u64,
         nonce: Nonce,
     ) -> Option<PacketBatch> {
-        if let Some(blockstore) = blockstore {
-            // Try to find the requested index in one of the slots
-            let packet = repair_response::repair_response_packet(
-                blockstore,
-                slot,
-                shred_index,
-                from_addr,
-                nonce,
-            );
-
-            if let Some(packet) = packet {
-                inc_new_counter_debug!("serve_repair-window-request-ledger", 1);
-                return Some(PacketBatch::new_unpinned_with_recycler_data(
-                    recycler,
-                    "run_window_request",
-                    vec![packet],
-                ));
-            }
-        }
-
-        inc_new_counter_debug!("serve_repair-window-request-fail", 1);
-        trace!(
-            "{}: failed WindowIndex {} {} {}",
-            my_id,
-            from.id,
+        // Try to find the requested index in one of the slots
+        let packet = repair_response::repair_response_packet(
+            blockstore,
             slot,
             shred_index,
-        );
+            from_addr,
+            nonce,
+        )?;
 
-        None
+        inc_new_counter_debug!("serve_repair-window-request-ledger", 1);
+        Some(PacketBatch::new_unpinned_with_recycler_data(
+            recycler,
+            "run_window_request",
+            vec![packet],
+        ))
     }
 
     fn run_highest_window_request(
         recycler: &PacketBatchRecycler,
         from_addr: &SocketAddr,
-        blockstore: Option<&Arc<Blockstore>>,
+        blockstore: &Blockstore,
         slot: Slot,
         highest_index: u64,
         nonce: Nonce,
     ) -> Option<PacketBatch> {
-        let blockstore = blockstore?;
         // Try to find the requested index in one of the slots
         let meta = blockstore.meta(slot).ok()??;
         if meta.received > highest_index {
@@ -674,35 +1085,35 @@ impl ServeRepair {
     fn run_orphan(
         recycler: &PacketBatchRecycler,
         from_addr: &SocketAddr,
-        blockstore: Option<&Arc<Blockstore>>,
+        blockstore: &Blockstore,
         mut slot: Slot,
         max_responses: usize,
         nonce: Nonce,
     ) -> Option<PacketBatch> {
-        let mut res = PacketBatch::new_unpinned_with_recycler(recycler.clone(), 64, "run_orphan");
-        if let Some(blockstore) = blockstore {
-            // Try to find the next "n" parent slots of the input slot
-            while let Ok(Some(meta)) = blockstore.meta(slot) {
-                if meta.received == 0 {
-                    break;
-                }
-                let packet = repair_response::repair_response_packet(
-                    blockstore,
-                    slot,
-                    meta.received - 1,
-                    from_addr,
-                    nonce,
-                );
-                if let Some(packet) = packet {
-                    res.packets.push(packet);
-                } else {
-                    break;
-                }
-                if meta.parent_slot.is_some() && res.packets.len() <= max_responses {
-                    slot = meta.parent_slot.unwrap();
-                } else {
-                    break;
-                }
+        let mut res =
+            PacketBatch::new_unpinned_with_recycler(recycler.clone(), max_responses, "run_orphan");
+        // Try to find the next "n" parent slots of the input slot
+        while let Ok(Some(meta)) = blockstore.meta(slot) {
+            if meta.received == 0 {
+                break;
+            }
+            let packet = repair_response::repair_response_packet(
+                blockstore,
+                slot,
+                meta.received - 1,
+                from_addr,
+                nonce,
+            );
+            if let Some(packet) = packet {
+                res.push(packet);
+            } else {
+                break;
+            }
+
+            if meta.parent_slot.is_some() && res.len() < max_responses {
+                slot = meta.parent_slot.unwrap();
+            } else {
+                break;
             }
         }
         if res.is_empty() {
@@ -714,11 +1125,10 @@ impl ServeRepair {
     fn run_ancestor_hashes(
         recycler: &PacketBatchRecycler,
         from_addr: &SocketAddr,
-        blockstore: Option<&Arc<Blockstore>>,
+        blockstore: &Blockstore,
         slot: Slot,
         nonce: Nonce,
     ) -> Option<PacketBatch> {
-        let blockstore = blockstore?;
         let ancestor_slot_hashes = if blockstore.is_duplicate_confirmed(slot) {
             let ancestor_iterator =
                 AncestorIteratorWithHash::from(AncestorIterator::new_inclusive(slot, blockstore));
@@ -727,7 +1137,7 @@ impl ServeRepair {
             // If this slot is not duplicate confirmed, return nothing
             vec![]
         };
-        let response = AncestorHashesResponseVersion::Current(ancestor_slot_hashes);
+        let response = AncestorHashesResponse::Hashes(ancestor_slot_hashes);
         let serialized_response = serialize(&response).ok()?;
 
         // Could probably directly write response into packet via `serialize_into()`
@@ -755,13 +1165,388 @@ mod tests {
         solana_ledger::{
             blockstore::make_many_slot_entries,
             blockstore_processor::fill_blockstore_slot_with_ticks,
+            genesis_utils::{create_genesis_config, GenesisConfigInfo},
             get_tmp_ledger_path,
-            shred::{max_ticks_per_n_shreds, Shred},
+            shred::{max_ticks_per_n_shreds, Shred, ShredFlags},
         },
-        solana_perf::packet::Packet,
-        solana_sdk::{hash::Hash, pubkey::Pubkey, signature::Keypair, timing::timestamp},
+        solana_perf::packet::{deserialize_from_with_limit, Packet},
+        solana_runtime::bank::Bank,
+        solana_sdk::{
+            feature_set::FeatureSet, hash::Hash, pubkey::Pubkey, signature::Keypair,
+            timing::timestamp,
+        },
         solana_streamer::socket::SocketAddrSpace,
+        std::io::Cursor,
     };
+
+    #[test]
+    fn test_serialized_ping_size() {
+        let mut rng = rand::thread_rng();
+        let keypair = Keypair::new();
+        let ping = Ping::new_rand(&mut rng, &keypair).unwrap();
+        let ping = RepairResponse::Ping(ping);
+        let pkt = Packet::from_data(None, ping).unwrap();
+        assert_eq!(pkt.meta.size, REPAIR_RESPONSE_SERIALIZED_PING_BYTES);
+    }
+
+    #[test]
+    fn test_deserialize_shred_as_ping() {
+        let data_buf = vec![7u8, 44]; // REPAIR_RESPONSE_SERIALIZED_PING_BYTES - SIZE_OF_DATA_SHRED_HEADERS
+        let keypair = Keypair::new();
+        let mut shred = Shred::new_from_data(
+            123, // slot
+            456, // index
+            111, // parent_offset
+            &data_buf,
+            ShredFlags::empty(),
+            222, // reference_tick
+            333, // version
+            444, // fec_set_index
+        );
+        shred.sign(&keypair);
+        let mut pkt = Packet::default();
+        shred.copy_to_packet(&mut pkt);
+        pkt.meta.size = REPAIR_RESPONSE_SERIALIZED_PING_BYTES;
+        let res = pkt.deserialize_slice::<RepairResponse, _>(..);
+        if let Ok(RepairResponse::Ping(ping)) = res {
+            assert!(!ping.verify());
+        } else {
+            assert!(res.is_err());
+        }
+    }
+
+    #[test]
+    fn test_serialize_deserialize_signed_request() {
+        let GenesisConfigInfo { genesis_config, .. } = create_genesis_config(10_000);
+        let bank = Bank::new_for_tests(&genesis_config);
+        let bank_forks = Arc::new(RwLock::new(BankForks::new(bank)));
+        let me = ContactInfo::new_localhost(&solana_sdk::pubkey::new_rand(), timestamp());
+        let cluster_info = Arc::new(new_test_cluster_info(me));
+        let serve_repair = ServeRepair::new(cluster_info.clone(), bank_forks);
+        let keypair = cluster_info.keypair().clone();
+        let repair_peer_id = solana_sdk::pubkey::new_rand();
+        let repair_request = ShredRepairType::Orphan(123);
+
+        let rsp = serve_repair
+            .map_repair_request(
+                &repair_request,
+                &repair_peer_id,
+                &mut RepairStats::default(),
+                456,
+                Some(&keypair),
+            )
+            .unwrap();
+
+        let mut cursor = Cursor::new(&rsp[..]);
+        let deserialized_request: RepairProtocol =
+            deserialize_from_with_limit(&mut cursor).unwrap();
+        assert_eq!(cursor.position(), rsp.len() as u64);
+        if let RepairProtocol::Orphan { header, slot } = deserialized_request {
+            assert_eq!(slot, 123);
+            assert_eq!(header.nonce, 456);
+            assert_eq!(&header.sender, &serve_repair.my_id());
+            assert_eq!(&header.recipient, &repair_peer_id);
+            let signed_data = [&rsp[..4], &rsp[4 + SIGNATURE_BYTES..]].concat();
+            assert!(header
+                .signature
+                .verify(keypair.pubkey().as_ref(), &signed_data));
+        } else {
+            panic!("unexpected request type {:?}", &deserialized_request);
+        }
+    }
+
+    #[test]
+    fn test_serialize_deserialize_ancestor_hashes_request() {
+        let slot = 50;
+        let nonce = 70;
+        let me = ContactInfo::new_localhost(&solana_sdk::pubkey::new_rand(), timestamp());
+        let cluster_info = Arc::new(new_test_cluster_info(me));
+        let repair_peer_id = solana_sdk::pubkey::new_rand();
+        let GenesisConfigInfo { genesis_config, .. } = create_genesis_config(10_000);
+        let keypair = cluster_info.keypair().clone();
+
+        let mut bank = Bank::new_for_tests(&genesis_config);
+        bank.feature_set = Arc::new(FeatureSet::all_enabled());
+        let bank_forks = Arc::new(RwLock::new(BankForks::new(bank)));
+        let serve_repair = ServeRepair::new(cluster_info.clone(), bank_forks.clone());
+
+        let root_bank = bank_forks.read().unwrap().root_bank();
+        let request_bytes = serve_repair
+            .ancestor_repair_request_bytes(&keypair, &root_bank, &repair_peer_id, slot, nonce)
+            .unwrap();
+        let mut cursor = Cursor::new(&request_bytes[..]);
+        let deserialized_request: RepairProtocol =
+            deserialize_from_with_limit(&mut cursor).unwrap();
+        assert_eq!(cursor.position(), request_bytes.len() as u64);
+        if let RepairProtocol::AncestorHashes {
+            header,
+            slot: deserialized_slot,
+        } = deserialized_request
+        {
+            assert_eq!(deserialized_slot, slot);
+            assert_eq!(header.nonce, nonce);
+            assert_eq!(&header.sender, &serve_repair.my_id());
+            assert_eq!(&header.recipient, &repair_peer_id);
+            let signed_data = [&request_bytes[..4], &request_bytes[4 + SIGNATURE_BYTES..]].concat();
+            assert!(header
+                .signature
+                .verify(keypair.pubkey().as_ref(), &signed_data));
+        } else {
+            panic!("unexpected request type {:?}", &deserialized_request);
+        }
+
+        let mut bank = Bank::new_for_tests(&genesis_config);
+        let mut feature_set = FeatureSet::all_enabled();
+        feature_set.deactivate(&sign_repair_requests::id());
+        bank.feature_set = Arc::new(feature_set);
+        let bank_forks = Arc::new(RwLock::new(BankForks::new(bank)));
+        let serve_repair = ServeRepair::new(cluster_info, bank_forks.clone());
+
+        let root_bank = bank_forks.read().unwrap().root_bank();
+        let request_bytes = serve_repair
+            .ancestor_repair_request_bytes(&keypair, &root_bank, &repair_peer_id, slot, nonce)
+            .unwrap();
+        let mut cursor = Cursor::new(&request_bytes[..]);
+        let deserialized_request: RepairProtocol =
+            deserialize_from_with_limit(&mut cursor).unwrap();
+        assert_eq!(cursor.position(), request_bytes.len() as u64);
+        if let RepairProtocol::LegacyAncestorHashes(ci, deserialized_slot, deserialized_nonce) =
+            deserialized_request
+        {
+            assert_eq!(slot, deserialized_slot);
+            assert_eq!(nonce, deserialized_nonce);
+            assert_eq!(&serve_repair.my_id(), &ci.id);
+        } else {
+            panic!("unexpected request type {:?}", &deserialized_request);
+        }
+    }
+
+    #[test]
+    fn test_map_requests_signed_unsigned() {
+        let GenesisConfigInfo { genesis_config, .. } = create_genesis_config(10_000);
+        let bank = Bank::new_for_tests(&genesis_config);
+        let bank_forks = Arc::new(RwLock::new(BankForks::new(bank)));
+        let me = ContactInfo::new_localhost(&solana_sdk::pubkey::new_rand(), timestamp());
+        let cluster_info = Arc::new(new_test_cluster_info(me));
+        let serve_repair = ServeRepair::new(cluster_info.clone(), bank_forks);
+        let keypair = cluster_info.keypair().clone();
+        let repair_peer_id = solana_sdk::pubkey::new_rand();
+
+        let slot = 50;
+        let shred_index = 60;
+        let nonce = 70;
+
+        let request = ShredRepairType::Shred(slot, shred_index);
+        let rsp = serve_repair
+            .map_repair_request(
+                &request,
+                &repair_peer_id,
+                &mut RepairStats::default(),
+                nonce,
+                Some(&keypair),
+            )
+            .unwrap();
+
+        let mut cursor = Cursor::new(&rsp[..]);
+        let deserialized_request: RepairProtocol =
+            deserialize_from_with_limit(&mut cursor).unwrap();
+        assert_eq!(cursor.position(), rsp.len() as u64);
+        if let RepairProtocol::WindowIndex {
+            header,
+            slot: deserialized_slot,
+            shred_index: deserialized_shred_index,
+        } = deserialized_request
+        {
+            assert_eq!(deserialized_slot, slot);
+            assert_eq!(deserialized_shred_index, shred_index);
+            assert_eq!(header.nonce, nonce);
+            assert_eq!(&header.sender, &serve_repair.my_id());
+            assert_eq!(&header.recipient, &repair_peer_id);
+            let signed_data = [&rsp[..4], &rsp[4 + SIGNATURE_BYTES..]].concat();
+            assert!(header
+                .signature
+                .verify(keypair.pubkey().as_ref(), &signed_data));
+        } else {
+            panic!("unexpected request type {:?}", &deserialized_request);
+        }
+
+        let rsp = serve_repair
+            .map_repair_request(
+                &request,
+                &repair_peer_id,
+                &mut RepairStats::default(),
+                nonce,
+                None,
+            )
+            .unwrap();
+
+        let mut cursor = Cursor::new(&rsp[..]);
+        let deserialized_request: RepairProtocol =
+            deserialize_from_with_limit(&mut cursor).unwrap();
+        assert_eq!(cursor.position(), rsp.len() as u64);
+        if let RepairProtocol::LegacyWindowIndexWithNonce(
+            ci,
+            deserialized_slot,
+            deserialized_shred_index,
+            deserialized_nonce,
+        ) = deserialized_request
+        {
+            assert_eq!(slot, deserialized_slot);
+            assert_eq!(shred_index, deserialized_shred_index);
+            assert_eq!(nonce, deserialized_nonce);
+            assert_eq!(&serve_repair.my_id(), &ci.id);
+        } else {
+            panic!("unexpected request type {:?}", &deserialized_request);
+        }
+
+        let request = ShredRepairType::HighestShred(slot, shred_index);
+        let rsp = serve_repair
+            .map_repair_request(
+                &request,
+                &repair_peer_id,
+                &mut RepairStats::default(),
+                nonce,
+                Some(&keypair),
+            )
+            .unwrap();
+
+        let mut cursor = Cursor::new(&rsp[..]);
+        let deserialized_request: RepairProtocol =
+            deserialize_from_with_limit(&mut cursor).unwrap();
+        assert_eq!(cursor.position(), rsp.len() as u64);
+        if let RepairProtocol::HighestWindowIndex {
+            header,
+            slot: deserialized_slot,
+            shred_index: deserialized_shred_index,
+        } = deserialized_request
+        {
+            assert_eq!(deserialized_slot, slot);
+            assert_eq!(deserialized_shred_index, shred_index);
+            assert_eq!(header.nonce, nonce);
+            assert_eq!(&header.sender, &serve_repair.my_id());
+            assert_eq!(&header.recipient, &repair_peer_id);
+            let signed_data = [&rsp[..4], &rsp[4 + SIGNATURE_BYTES..]].concat();
+            assert!(header
+                .signature
+                .verify(keypair.pubkey().as_ref(), &signed_data));
+        } else {
+            panic!("unexpected request type {:?}", &deserialized_request);
+        }
+
+        let rsp = serve_repair
+            .map_repair_request(
+                &request,
+                &repair_peer_id,
+                &mut RepairStats::default(),
+                nonce,
+                None,
+            )
+            .unwrap();
+
+        let mut cursor = Cursor::new(&rsp[..]);
+        let deserialized_request: RepairProtocol =
+            deserialize_from_with_limit(&mut cursor).unwrap();
+        assert_eq!(cursor.position(), rsp.len() as u64);
+        if let RepairProtocol::LegacyHighestWindowIndexWithNonce(
+            ci,
+            deserialized_slot,
+            deserialized_shred_index,
+            deserialized_nonce,
+        ) = deserialized_request
+        {
+            assert_eq!(slot, deserialized_slot);
+            assert_eq!(shred_index, deserialized_shred_index);
+            assert_eq!(nonce, deserialized_nonce);
+            assert_eq!(&serve_repair.my_id(), &ci.id);
+        } else {
+            panic!("unexpected request type {:?}", &deserialized_request);
+        }
+    }
+
+    #[test]
+    fn test_verify_signed_packet() {
+        let keypair = Keypair::new();
+        let other_keypair = Keypair::new();
+        let my_id = Pubkey::new_unique();
+        let other_id = Pubkey::new_unique();
+
+        fn sign_packet(packet: &mut Packet, keypair: &Keypair) {
+            let signable_data = [
+                packet.data(..4).unwrap(),
+                packet.data(4 + SIGNATURE_BYTES..).unwrap(),
+            ]
+            .concat();
+            let signature = keypair.sign_message(&signable_data[..]);
+            packet.buffer_mut()[4..4 + SIGNATURE_BYTES].copy_from_slice(signature.as_ref());
+        }
+
+        // well formed packet
+        let packet = {
+            let header = RepairRequestHeader::new(keypair.pubkey(), my_id, timestamp(), 678);
+            let slot = 239847;
+            let request = RepairProtocol::Orphan { header, slot };
+            let mut packet = Packet::from_data(None, &request).unwrap();
+            sign_packet(&mut packet, &keypair);
+            packet
+        };
+        let request: RepairProtocol = packet.deserialize_slice(..).unwrap();
+        assert!(ServeRepair::verify_signed_packet(
+            &my_id,
+            &packet,
+            &request,
+            &mut ServeRepairStats::default(),
+        ));
+
+        // recipient mismatch
+        let packet = {
+            let header = RepairRequestHeader::new(keypair.pubkey(), other_id, timestamp(), 678);
+            let slot = 239847;
+            let request = RepairProtocol::Orphan { header, slot };
+            let mut packet = Packet::from_data(None, &request).unwrap();
+            sign_packet(&mut packet, &keypair);
+            packet
+        };
+        let request: RepairProtocol = packet.deserialize_slice(..).unwrap();
+        let mut stats = ServeRepairStats::default();
+        assert!(!ServeRepair::verify_signed_packet(
+            &my_id, &packet, &request, &mut stats,
+        ));
+        assert_eq!(stats.err_id_mismatch, 1);
+
+        // outside time window
+        let packet = {
+            let time_diff_ms = u64::try_from(SIGNED_REPAIR_TIME_WINDOW.as_millis() * 2).unwrap();
+            let old_timestamp = timestamp().saturating_sub(time_diff_ms);
+            let header = RepairRequestHeader::new(keypair.pubkey(), my_id, old_timestamp, 678);
+            let slot = 239847;
+            let request = RepairProtocol::Orphan { header, slot };
+            let mut packet = Packet::from_data(None, &request).unwrap();
+            sign_packet(&mut packet, &keypair);
+            packet
+        };
+        let request: RepairProtocol = packet.deserialize_slice(..).unwrap();
+        let mut stats = ServeRepairStats::default();
+        assert!(!ServeRepair::verify_signed_packet(
+            &my_id, &packet, &request, &mut stats,
+        ));
+        assert_eq!(stats.err_time_skew, 1);
+
+        // bad signature
+        let packet = {
+            let header = RepairRequestHeader::new(keypair.pubkey(), my_id, timestamp(), 678);
+            let slot = 239847;
+            let request = RepairProtocol::Orphan { header, slot };
+            let mut packet = Packet::from_data(None, &request).unwrap();
+            sign_packet(&mut packet, &other_keypair);
+            packet
+        };
+        let request: RepairProtocol = packet.deserialize_slice(..).unwrap();
+        let mut stats = ServeRepairStats::default();
+        assert!(!ServeRepair::verify_signed_packet(
+            &my_id, &packet, &request, &mut stats,
+        ));
+        assert_eq!(stats.err_sig_verify, 1);
+    }
 
     #[test]
     fn test_run_highest_window_request() {
@@ -778,7 +1563,7 @@ mod tests {
             let rv = ServeRepair::run_highest_window_request(
                 &recycler,
                 &socketaddr_any!(),
-                Some(&blockstore),
+                &blockstore,
                 0,
                 0,
                 nonce,
@@ -797,21 +1582,20 @@ mod tests {
             let rv = ServeRepair::run_highest_window_request(
                 &recycler,
                 &socketaddr_any!(),
-                Some(&blockstore),
+                &blockstore,
                 slot,
                 index,
                 nonce,
             )
             .expect("packets");
             let request = ShredRepairType::HighestShred(slot, index);
-            verify_responses(&request, rv.packets.iter());
+            verify_responses(&request, rv.iter());
 
             let rv: Vec<Shred> = rv
-                .packets
                 .into_iter()
-                .filter_map(|b| {
-                    assert_eq!(repair_response::nonce(&b.data[..]).unwrap(), nonce);
-                    Shred::new_from_serialized_shred(b.data.to_vec()).ok()
+                .filter_map(|p| {
+                    assert_eq!(repair_response::nonce(p).unwrap(), nonce);
+                    Shred::new_from_serialized_shred(p.data(..).unwrap().to_vec()).ok()
                 })
                 .collect();
             assert!(!rv.is_empty());
@@ -822,7 +1606,7 @@ mod tests {
             let rv = ServeRepair::run_highest_window_request(
                 &recycler,
                 &socketaddr_any!(),
-                Some(&blockstore),
+                &blockstore,
                 slot,
                 index + 1,
                 nonce,
@@ -845,33 +1629,16 @@ mod tests {
         let ledger_path = get_tmp_ledger_path!();
         {
             let blockstore = Arc::new(Blockstore::open(&ledger_path).unwrap());
-            let me = ContactInfo {
-                id: solana_sdk::pubkey::new_rand(),
-                gossip: socketaddr!("127.0.0.1:1234"),
-                tvu: socketaddr!("127.0.0.1:1235"),
-                tvu_forwards: socketaddr!("127.0.0.1:1236"),
-                repair: socketaddr!("127.0.0.1:1237"),
-                tpu: socketaddr!("127.0.0.1:1238"),
-                tpu_forwards: socketaddr!("127.0.0.1:1239"),
-                tpu_vote: socketaddr!("127.0.0.1:1240"),
-                rpc: socketaddr!("127.0.0.1:1241"),
-                rpc_pubsub: socketaddr!("127.0.0.1:1242"),
-                serve_repair: socketaddr!("127.0.0.1:1243"),
-                wallclock: 0,
-                shred_version: 0,
-            };
             let rv = ServeRepair::run_window_request(
                 &recycler,
-                &me,
                 &socketaddr_any!(),
-                Some(&blockstore),
-                &me.id,
+                &blockstore,
                 slot,
                 0,
                 nonce,
             );
             assert!(rv.is_none());
-            let shred = Shred::new_from_data(slot, 1, 1, None, false, false, 0, 2, 0);
+            let shred = Shred::new_from_data(slot, 1, 1, &[], ShredFlags::empty(), 0, 2, 0);
 
             blockstore
                 .insert_shreds(vec![shred], None, false)
@@ -880,23 +1647,20 @@ mod tests {
             let index = 1;
             let rv = ServeRepair::run_window_request(
                 &recycler,
-                &me,
                 &socketaddr_any!(),
-                Some(&blockstore),
-                &me.id,
+                &blockstore,
                 slot,
                 index,
                 nonce,
             )
             .expect("packets");
             let request = ShredRepairType::Shred(slot, index);
-            verify_responses(&request, rv.packets.iter());
+            verify_responses(&request, rv.iter());
             let rv: Vec<Shred> = rv
-                .packets
                 .into_iter()
-                .filter_map(|b| {
-                    assert_eq!(repair_response::nonce(&b.data[..]).unwrap(), nonce);
-                    Shred::new_from_serialized_shred(b.data.to_vec()).ok()
+                .filter_map(|p| {
+                    assert_eq!(repair_response::nonce(p).unwrap(), nonce);
+                    Shred::new_from_serialized_shred(p.data(..).unwrap().to_vec()).ok()
                 })
                 .collect();
             assert_eq!(rv[0].index(), 1);
@@ -916,10 +1680,13 @@ mod tests {
 
     #[test]
     fn window_index_request() {
+        let GenesisConfigInfo { genesis_config, .. } = create_genesis_config(10_000);
+        let bank = Bank::new_for_tests(&genesis_config);
+        let bank_forks = Arc::new(RwLock::new(BankForks::new(bank)));
         let cluster_slots = ClusterSlots::default();
         let me = ContactInfo::new_localhost(&solana_sdk::pubkey::new_rand(), timestamp());
         let cluster_info = Arc::new(new_test_cluster_info(me));
-        let serve_repair = ServeRepair::new(cluster_info.clone());
+        let serve_repair = ServeRepair::new(cluster_info.clone(), bank_forks);
         let mut outstanding_requests = OutstandingShredRepairs::default();
         let rv = serve_repair.repair_request(
             &cluster_slots,
@@ -928,6 +1695,7 @@ mod tests {
             &mut RepairStats::default(),
             &None,
             &mut outstanding_requests,
+            None,
         );
         assert_matches!(rv, Err(Error::ClusterInfo(ClusterInfoError::NoPeers)));
 
@@ -956,6 +1724,7 @@ mod tests {
                 &mut RepairStats::default(),
                 &None,
                 &mut outstanding_requests,
+                None,
             )
             .unwrap();
         assert_eq!(nxt.serve_repair, serve_repair_addr);
@@ -990,6 +1759,7 @@ mod tests {
                     &mut RepairStats::default(),
                     &None,
                     &mut outstanding_requests,
+                    None,
                 )
                 .unwrap();
             if rv.0 == serve_repair_addr {
@@ -1013,14 +1783,8 @@ mod tests {
         let ledger_path = get_tmp_ledger_path!();
         {
             let blockstore = Arc::new(Blockstore::open(&ledger_path).unwrap());
-            let rv = ServeRepair::run_orphan(
-                &recycler,
-                &socketaddr_any!(),
-                Some(&blockstore),
-                slot,
-                0,
-                nonce,
-            );
+            let rv =
+                ServeRepair::run_orphan(&recycler, &socketaddr_any!(), &blockstore, slot, 0, nonce);
             assert!(rv.is_none());
 
             // Create slots [slot, slot + num_slots) with 5 shreds apiece
@@ -1034,7 +1798,7 @@ mod tests {
             let rv = ServeRepair::run_orphan(
                 &recycler,
                 &socketaddr_any!(),
-                Some(&blockstore),
+                &blockstore,
                 slot + num_slots,
                 5,
                 nonce,
@@ -1046,13 +1810,12 @@ mod tests {
             let rv: Vec<_> = ServeRepair::run_orphan(
                 &recycler,
                 &socketaddr_any!(),
-                Some(&blockstore),
+                &blockstore,
                 slot + num_slots - 1,
                 5,
                 nonce,
             )
             .expect("run_orphan packets")
-            .packets
             .iter()
             .cloned()
             .collect();
@@ -1090,11 +1853,12 @@ mod tests {
             // Create slots [1, 2] with 1 shred apiece
             let (mut shreds, _) = make_many_slot_entries(1, 2, 1);
 
-            // Make shred for slot 1 too large
             assert_eq!(shreds[0].slot(), 1);
             assert_eq!(shreds[0].index(), 0);
-            shreds[0].payload.push(10);
-            shreds[0].data_header.size = shreds[0].payload.len() as u16;
+            // TODO: The test previously relied on corrupting shred payload
+            // size which we no longer want to expose. Current test no longer
+            // covers packet size check in repair_response_packet_from_bytes.
+            shreds.remove(0);
             blockstore
                 .insert_shreds(shreds, None, false)
                 .expect("Expect successful ledger write");
@@ -1112,19 +1876,12 @@ mod tests {
             // Orphan request for slot 2 should only return slot 1 since
             // calling `repair_response_packet` on slot 1's shred will
             // be corrupted
-            let rv: Vec<_> = ServeRepair::run_orphan(
-                &recycler,
-                &socketaddr_any!(),
-                Some(&blockstore),
-                2,
-                5,
-                nonce,
-            )
-            .expect("run_orphan packets")
-            .packets
-            .iter()
-            .cloned()
-            .collect();
+            let rv: Vec<_> =
+                ServeRepair::run_orphan(&recycler, &socketaddr_any!(), &blockstore, 2, 5, nonce)
+                    .expect("run_orphan packets")
+                    .iter()
+                    .cloned()
+                    .collect();
 
             // Verify responses
             let expected = vec![repair_response::repair_response_packet(
@@ -1143,6 +1900,12 @@ mod tests {
 
     #[test]
     fn test_run_ancestor_hashes() {
+        fn deserialize_ancestor_hashes_response(packet: &Packet) -> AncestorHashesResponse {
+            packet
+                .deserialize_slice(..packet.meta.size - SIZE_OF_NONCE)
+                .unwrap()
+        }
+
         solana_logger::setup();
         let recycler = PacketBatchRecycler::default();
         let ledger_path = get_tmp_ledger_path!();
@@ -1164,34 +1927,44 @@ mod tests {
             let rv = ServeRepair::run_ancestor_hashes(
                 &recycler,
                 &socketaddr_any!(),
-                Some(&blockstore),
+                &blockstore,
                 slot + num_slots,
                 nonce,
             )
-            .expect("run_ancestor_hashes packets")
-            .packets;
+            .expect("run_ancestor_hashes packets");
             assert_eq!(rv.len(), 1);
             let packet = &rv[0];
-            let ancestor_hashes_response: AncestorHashesResponseVersion =
-                limited_deserialize(&packet.data[..packet.meta.size - SIZE_OF_NONCE]).unwrap();
-            assert!(ancestor_hashes_response.into_slot_hashes().is_empty());
+            let ancestor_hashes_response = deserialize_ancestor_hashes_response(packet);
+            match ancestor_hashes_response {
+                AncestorHashesResponse::Hashes(hashes) => {
+                    assert!(hashes.is_empty());
+                }
+                _ => {
+                    panic!("unexpected response: {:?}", &ancestor_hashes_response);
+                }
+            }
 
             // `slot + num_slots - 1` is not marked duplicate confirmed so nothing should return
             // empty
             let rv = ServeRepair::run_ancestor_hashes(
                 &recycler,
                 &socketaddr_any!(),
-                Some(&blockstore),
+                &blockstore,
                 slot + num_slots - 1,
                 nonce,
             )
-            .expect("run_ancestor_hashes packets")
-            .packets;
+            .expect("run_ancestor_hashes packets");
             assert_eq!(rv.len(), 1);
             let packet = &rv[0];
-            let ancestor_hashes_response: AncestorHashesResponseVersion =
-                limited_deserialize(&packet.data[..packet.meta.size - SIZE_OF_NONCE]).unwrap();
-            assert!(ancestor_hashes_response.into_slot_hashes().is_empty());
+            let ancestor_hashes_response = deserialize_ancestor_hashes_response(packet);
+            match ancestor_hashes_response {
+                AncestorHashesResponse::Hashes(hashes) => {
+                    assert!(hashes.is_empty());
+                }
+                _ => {
+                    panic!("unexpected response: {:?}", &ancestor_hashes_response);
+                }
+            }
 
             // Set duplicate confirmed
             let mut expected_ancestors = Vec::with_capacity(num_slots as usize);
@@ -1205,20 +1978,22 @@ mod tests {
             let rv = ServeRepair::run_ancestor_hashes(
                 &recycler,
                 &socketaddr_any!(),
-                Some(&blockstore),
+                &blockstore,
                 slot + num_slots - 1,
                 nonce,
             )
-            .expect("run_ancestor_hashes packets")
-            .packets;
+            .expect("run_ancestor_hashes packets");
             assert_eq!(rv.len(), 1);
             let packet = &rv[0];
-            let ancestor_hashes_response: AncestorHashesResponseVersion =
-                limited_deserialize(&packet.data[..packet.meta.size - SIZE_OF_NONCE]).unwrap();
-            assert_eq!(
-                ancestor_hashes_response.into_slot_hashes(),
-                expected_ancestors
-            );
+            let ancestor_hashes_response = deserialize_ancestor_hashes_response(packet);
+            match ancestor_hashes_response {
+                AncestorHashesResponse::Hashes(hashes) => {
+                    assert_eq!(hashes, expected_ancestors);
+                }
+                _ => {
+                    panic!("unexpected response: {:?}", &ancestor_hashes_response);
+                }
+            }
         }
 
         Blockstore::destroy(&ledger_path).expect("Expected successful database destruction");
@@ -1226,6 +2001,9 @@ mod tests {
 
     #[test]
     fn test_repair_with_repair_validators() {
+        let GenesisConfigInfo { genesis_config, .. } = create_genesis_config(10_000);
+        let bank = Bank::new_for_tests(&genesis_config);
+        let bank_forks = Arc::new(RwLock::new(BankForks::new(bank)));
         let cluster_slots = ClusterSlots::default();
         let me = ContactInfo::new_localhost(&solana_sdk::pubkey::new_rand(), timestamp());
         let cluster_info = Arc::new(new_test_cluster_info(me.clone()));
@@ -1237,7 +2015,7 @@ mod tests {
             ContactInfo::new_localhost(&solana_sdk::pubkey::new_rand(), timestamp());
         cluster_info.insert_info(contact_info2.clone());
         cluster_info.insert_info(contact_info3.clone());
-        let serve_repair = ServeRepair::new(cluster_info);
+        let serve_repair = ServeRepair::new(cluster_info, bank_forks);
 
         // If:
         // 1) repair validator set doesn't exist in gossip
@@ -1254,6 +2032,7 @@ mod tests {
                     &mut RepairStats::default(),
                     &known_validators,
                     &mut OutstandingShredRepairs::default(),
+                    None,
                 )
                 .is_err());
         }
@@ -1271,6 +2050,7 @@ mod tests {
                 &mut RepairStats::default(),
                 &known_validators,
                 &mut OutstandingShredRepairs::default(),
+                None,
             )
             .is_ok());
 
@@ -1292,12 +2072,16 @@ mod tests {
                 &mut RepairStats::default(),
                 &None,
                 &mut OutstandingShredRepairs::default(),
+                None,
             )
             .is_ok());
     }
 
     #[test]
     fn test_verify_shred_response() {
+        fn new_test_data_shred(slot: Slot, index: u32) -> Shred {
+            Shred::new_from_data(slot, index, 1, &[], ShredFlags::empty(), 0, 0, 0)
+        }
         let repair = ShredRepairType::Orphan(9);
         // Ensure new options are addded to this test
         match repair {
@@ -1310,47 +2094,40 @@ mod tests {
         let index = 5;
 
         // Orphan
-        let mut shred = Shred::new_empty_data_shred();
-        shred.set_slot(slot);
+        let shred = new_test_data_shred(slot, 0);
         let request = ShredRepairType::Orphan(slot);
         assert!(request.verify_response(&shred));
-        shred.set_slot(slot - 1);
+        let shred = new_test_data_shred(slot - 1, 0);
         assert!(request.verify_response(&shred));
-        shred.set_slot(slot + 1);
+        let shred = new_test_data_shred(slot + 1, 0);
         assert!(!request.verify_response(&shred));
 
         // HighestShred
-        shred = Shred::new_empty_data_shred();
-        shred.set_slot(slot);
-        shred.set_index(index);
+        let shred = new_test_data_shred(slot, index);
         let request = ShredRepairType::HighestShred(slot, index as u64);
         assert!(request.verify_response(&shred));
-        shred.set_index(index + 1);
+        let shred = new_test_data_shred(slot, index + 1);
         assert!(request.verify_response(&shred));
-        shred.set_index(index - 1);
+        let shred = new_test_data_shred(slot, index - 1);
         assert!(!request.verify_response(&shred));
-        shred.set_slot(slot - 1);
-        shred.set_index(index);
+        let shred = new_test_data_shred(slot - 1, index);
         assert!(!request.verify_response(&shred));
-        shred.set_slot(slot + 1);
+        let shred = new_test_data_shred(slot + 1, index);
         assert!(!request.verify_response(&shred));
 
         // Shred
-        shred = Shred::new_empty_data_shred();
-        shred.set_slot(slot);
-        shred.set_index(index);
+        let shred = new_test_data_shred(slot, index);
         let request = ShredRepairType::Shred(slot, index as u64);
         assert!(request.verify_response(&shred));
-        shred.set_index(index + 1);
+        let shred = new_test_data_shred(slot, index + 1);
         assert!(!request.verify_response(&shred));
-        shred.set_slot(slot + 1);
-        shred.set_index(index);
+        let shred = new_test_data_shred(slot + 1, index);
         assert!(!request.verify_response(&shred));
     }
 
     fn verify_responses<'a>(request: &ShredRepairType, packets: impl Iterator<Item = &'a Packet>) {
         for packet in packets {
-            let shred_payload = packet.data.to_vec();
+            let shred_payload = packet.data(..).unwrap().to_vec();
             let shred = Shred::new_from_serialized_shred(shred_payload).unwrap();
             request.verify_response(&shred);
         }
@@ -1364,10 +2141,10 @@ mod tests {
             .into_iter()
             .map(|slot| (slot, Hash::new_unique()))
             .collect();
-        assert!(repair.verify_response(&AncestorHashesResponseVersion::Current(response.clone())));
+        assert!(repair.verify_response(&AncestorHashesResponse::Hashes(response.clone())));
 
         // over the allowed limit, should fail
         response.push((request_slot, Hash::new_unique()));
-        assert!(!repair.verify_response(&AncestorHashesResponseVersion::Current(response)));
+        assert!(!repair.verify_response(&AncestorHashesResponse::Hashes(response)));
     }
 }

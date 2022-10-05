@@ -41,7 +41,7 @@ pub const DEFAULT_GENESIS_DOWNLOAD_PATH: &str = "/genesis.tar.bz2";
 pub const UNUSED_DEFAULT: u64 = 1024;
 
 // The order can't align with release lifecycle only to remain ABI-compatible...
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, AbiEnumVisitor, AbiExample)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, AbiEnumVisitor, AbiExample)]
 pub enum ClusterType {
     Testnet,
     MainnetBeta,
@@ -197,7 +197,7 @@ impl GenesisConfig {
             )
         })?;
 
-        std::fs::create_dir_all(&ledger_path)?;
+        std::fs::create_dir_all(ledger_path)?;
 
         let mut file = File::create(Self::genesis_filename(ledger_path))?;
         file.write_all(&serialized)
@@ -343,6 +343,6 @@ mod tests {
         config.write(path).expect("write");
         let loaded_config = GenesisConfig::load(path).expect("load");
         assert_eq!(config.hash(), loaded_config.hash());
-        let _ignored = std::fs::remove_file(&path);
+        let _ignored = std::fs::remove_file(path);
     }
 }

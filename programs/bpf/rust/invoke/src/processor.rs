@@ -14,6 +14,9 @@ use {
         program::{get_return_data, invoke, invoke_signed, set_return_data},
         program_error::ProgramError,
         pubkey::{Pubkey, PubkeyError},
+        syscalls::{
+            MAX_CPI_ACCOUNT_INFOS, MAX_CPI_INSTRUCTION_ACCOUNTS, MAX_CPI_INSTRUCTION_DATA_LEN,
+        },
         system_instruction,
     },
 };
@@ -554,20 +557,28 @@ fn process_instruction(
                 &[&[b"You pass butter", &[bump_seed1]]],
             )?;
         }
-        TEST_INSTRUCTION_DATA_TOO_LARGE => {
-            msg!("Test instruction data too large");
+        TEST_MAX_INSTRUCTION_DATA_LEN_EXCEEDED => {
+            msg!("Test max instruction data len exceeded");
+            let data_len = MAX_CPI_INSTRUCTION_DATA_LEN.saturating_add(1) as usize;
             let instruction =
-                create_instruction(*accounts[INVOKED_PROGRAM_INDEX].key, &[], vec![0; 1500]);
+                create_instruction(*accounts[INVOKED_PROGRAM_INDEX].key, &[], vec![0; data_len]);
             invoke_signed(&instruction, &[], &[])?;
         }
-        TEST_INSTRUCTION_META_TOO_LARGE => {
-            msg!("Test instruction metas too large");
-            let instruction = create_instruction(
-                *accounts[INVOKED_PROGRAM_INDEX].key,
-                &[(&Pubkey::default(), false, false); 40],
-                vec![],
-            );
+        TEST_MAX_INSTRUCTION_ACCOUNTS_EXCEEDED => {
+            msg!("Test max instruction accounts exceeded");
+            let default_key = Pubkey::default();
+            let account_metas_len = (MAX_CPI_INSTRUCTION_ACCOUNTS as usize).saturating_add(1);
+            let account_metas = vec![(&default_key, false, false); account_metas_len];
+            let instruction =
+                create_instruction(*accounts[INVOKED_PROGRAM_INDEX].key, &account_metas, vec![]);
             invoke_signed(&instruction, &[], &[])?;
+        }
+        TEST_MAX_ACCOUNT_INFOS_EXCEEDED => {
+            msg!("Test max account infos exceeded");
+            let instruction = create_instruction(*accounts[INVOKED_PROGRAM_INDEX].key, &[], vec![]);
+            let account_infos_len = (MAX_CPI_ACCOUNT_INFOS as usize).saturating_add(1);
+            let account_infos = vec![accounts[0].clone(); account_infos_len];
+            invoke_signed(&instruction, &account_infos, &[])?;
         }
         TEST_RETURN_ERROR => {
             msg!("Test return error");
@@ -627,38 +638,6 @@ fn process_instruction(
         }
         TEST_NESTED_INVOKE_TOO_DEEP => {
             let _ = do_nested_invokes(5, accounts);
-        }
-        TEST_EXECUTABLE_LAMPORTS => {
-            msg!("Test executable lamports");
-            let mut accounts = accounts.to_vec();
-
-            // set account to executable and subtract lamports
-            accounts[ARGUMENT_INDEX].executable = true;
-            {
-                let mut lamports = (*accounts[ARGUMENT_INDEX].lamports).borrow_mut();
-                **lamports = (*lamports).saturating_sub(1);
-            }
-            // add lamports to dest account
-            {
-                let mut lamports = (*accounts[DERIVED_KEY1_INDEX].lamports).borrow_mut();
-                **lamports = (*lamports).saturating_add(1);
-            }
-
-            let instruction = create_instruction(
-                *program_id,
-                &[
-                    (accounts[ARGUMENT_INDEX].key, true, false),
-                    (accounts[DERIVED_KEY1_INDEX].key, true, false),
-                ],
-                vec![ADD_LAMPORTS, 0, 0, 0],
-            );
-            let _ = invoke(&instruction, &accounts);
-
-            // reset executable account
-            {
-                let mut lamports = (*accounts[ARGUMENT_INDEX].lamports).borrow_mut();
-                **lamports = (*lamports).saturating_add(1);
-            }
         }
         TEST_CALL_PRECOMPILE => {
             msg!("Test calling precompiled program from cpi");

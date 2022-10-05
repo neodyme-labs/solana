@@ -14,7 +14,7 @@ pub(crate) type DuplicateSlotsToRepair = HashMap<Slot, Hash>;
 pub(crate) type EpochSlotsFrozenSlots = BTreeMap<Slot, Hash>;
 pub(crate) type GossipDuplicateConfirmedSlots = BTreeMap<Slot, Hash>;
 
-#[derive(PartialEq, Clone, Debug)]
+#[derive(PartialEq, Eq, Clone, Debug)]
 pub enum ClusterConfirmedHash {
     // Ordered from strongest confirmation to weakest. Stronger
     // confirmations take precedence over weaker ones.
@@ -22,7 +22,7 @@ pub enum ClusterConfirmedHash {
     EpochSlotsFrozen(Hash),
 }
 
-#[derive(PartialEq, Clone, Debug)]
+#[derive(PartialEq, Eq, Clone, Debug)]
 pub enum BankStatus {
     Frozen(Hash),
     Dead,
@@ -71,7 +71,7 @@ impl BankStatus {
     }
 }
 
-#[derive(PartialEq, Debug)]
+#[derive(PartialEq, Eq, Debug)]
 pub struct DeadState {
     // Keep fields private, forces construction
     // via constructor
@@ -106,7 +106,7 @@ impl DeadState {
     }
 }
 
-#[derive(PartialEq, Debug)]
+#[derive(PartialEq, Eq, Debug)]
 pub struct BankFrozenState {
     // Keep fields private, forces construction
     // via constructor
@@ -149,7 +149,7 @@ impl BankFrozenState {
     }
 }
 
-#[derive(PartialEq, Debug)]
+#[derive(PartialEq, Eq, Debug)]
 pub struct DuplicateConfirmedState {
     // Keep fields private, forces construction
     // via constructor
@@ -174,7 +174,7 @@ impl DuplicateConfirmedState {
     }
 }
 
-#[derive(PartialEq, Debug)]
+#[derive(PartialEq, Eq, Debug)]
 pub struct DuplicateState {
     // Keep fields private, forces construction
     // via constructor
@@ -211,7 +211,7 @@ impl DuplicateState {
     }
 }
 
-#[derive(PartialEq, Debug)]
+#[derive(PartialEq, Eq, Debug)]
 pub struct EpochSlotsFrozenState {
     // Keep fields private, forces construction
     // via constructor
@@ -255,7 +255,7 @@ impl EpochSlotsFrozenState {
     }
 }
 
-#[derive(PartialEq, Debug)]
+#[derive(PartialEq, Eq, Debug)]
 pub enum SlotStateUpdate {
     BankFrozen(BankFrozenState),
     DuplicateConfirmed(DuplicateConfirmedState),
@@ -280,7 +280,7 @@ impl SlotStateUpdate {
     }
 }
 
-#[derive(PartialEq, Debug)]
+#[derive(PartialEq, Eq, Debug)]
 pub enum ResultingStateChange {
     // Bank was frozen
     BankFrozen(Hash),
@@ -299,7 +299,7 @@ pub enum ResultingStateChange {
 impl SlotStateUpdate {
     fn into_state_changes(self, slot: Slot) -> Vec<ResultingStateChange> {
         let bank_frozen_hash = self.bank_hash();
-        if bank_frozen_hash == None {
+        if bank_frozen_hash.is_none() {
             // If the bank hasn't been frozen yet, then there's nothing to do
             // since replay of the slot hasn't finished yet.
             return vec![];
@@ -753,10 +753,7 @@ pub(crate) fn check_slot_agrees_with_cluster(
     slot_state_update: SlotStateUpdate,
 ) {
     info!(
-        "check_slot_agrees_with_cluster()
-        slot: {},
-        root: {},
-        slot_state_update: {:?}",
+        "check_slot_agrees_with_cluster() slot: {}, root: {}, slot_state_update: {:?}",
         slot, root, slot_state_update
     );
 
@@ -766,11 +763,33 @@ pub(crate) fn check_slot_agrees_with_cluster(
 
     // Needs to happen before the bank_frozen_hash.is_none() check below to account for duplicate
     // signals arriving before the bank is constructed in replay.
-    if matches!(slot_state_update, SlotStateUpdate::Duplicate(_)) {
+    if let SlotStateUpdate::Duplicate(ref state) = slot_state_update {
         // If this slot has already been processed before, return
         if !duplicate_slots_tracker.insert(slot) {
             return;
         }
+
+        datapoint_info!(
+            "duplicate_slot",
+            ("slot", slot, i64),
+            (
+                "duplicate_confirmed_hash",
+                state
+                    .duplicate_confirmed_hash
+                    .unwrap_or_default()
+                    .to_string(),
+                String
+            ),
+            (
+                "my_hash",
+                state
+                    .bank_status
+                    .bank_hash()
+                    .unwrap_or_default()
+                    .to_string(),
+                String
+            ),
+        );
     }
 
     // Avoid duplicate work from multiple of the same DuplicateConfirmed signal. This can
@@ -781,6 +800,25 @@ pub(crate) fn check_slot_agrees_with_cluster(
                 return;
             }
         }
+
+        datapoint_info!(
+            "duplicate_confirmed_slot",
+            ("slot", slot, i64),
+            (
+                "duplicate_confirmed_hash",
+                state.duplicate_confirmed_hash.to_string(),
+                String
+            ),
+            (
+                "my_hash",
+                state
+                    .bank_status
+                    .bank_hash()
+                    .unwrap_or_default()
+                    .to_string(),
+                String
+            ),
+        );
     }
 
     if let SlotStateUpdate::EpochSlotsFrozen(epoch_slots_frozen_state) = &slot_state_update {
@@ -1336,14 +1374,7 @@ mod test {
         // Create simple fork 0 -> 1 -> 2 -> 3
         let forks = tr(0) / (tr(1) / (tr(2) / tr(3)));
         let (vote_simulator, blockstore) = setup_forks_from_tree(forks, 1, None);
-
-        let descendants = vote_simulator
-            .bank_forks
-            .read()
-            .unwrap()
-            .descendants()
-            .clone();
-
+        let descendants = vote_simulator.bank_forks.read().unwrap().descendants();
         InitialState {
             heaviest_subtree_fork_choice: vote_simulator.heaviest_subtree_fork_choice,
             progress: vote_simulator.progress,

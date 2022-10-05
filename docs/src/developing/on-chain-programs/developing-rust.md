@@ -59,8 +59,7 @@ For example:
 First setup the environment:
 
 - Install the latest Rust stable from https://rustup.rs/
-- Install the latest Solana command-line tools from
-  https://docs.solana.com/cli/install-solana-cli-tools
+- Install the latest [Solana command-line tools](../../cli/install-solana-cli-tools.md)
 
 The normal cargo build is available for building programs against your host
 machine which can be used for unit testing:
@@ -218,7 +217,6 @@ single-threaded environment, and must be deterministic:
   - `rand`
   - `std::fs`
   - `std::net`
-  - `std::os`
   - `std::future`
   - `std::process`
   - `std::sync`
@@ -331,7 +329,7 @@ custom-panic = []
 Then provide a custom implementation of the panic handler:
 
 ```rust
-#[cfg(all(feature = "custom-panic", target_arch = "bpf"))]
+#[cfg(all(feature = "custom-panic", target_os = "solana"))]
 #[no_mangle]
 fn custom_panic(info: &core::panic::PanicInfo<'_>) {
     solana_program::msg!("program custom panic enabled");
@@ -352,7 +350,7 @@ programs can provide their own custom panic handler with an empty
 implementation.
 
 ```rust
-#[cfg(all(feature = "custom-panic", target_arch = "bpf"))]
+#[cfg(all(feature = "custom-panic", target_os = "solana"))]
 #[no_mangle]
 fn custom_panic(info: &core::panic::PanicInfo<'_>) {
     // Do nothing to save space

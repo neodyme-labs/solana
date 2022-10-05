@@ -1,6 +1,6 @@
 import React from "react";
 import { TableCardBody } from "components/common/TableCardBody";
-import { SolBalance } from "utils";
+import { SolBalance } from "components/common/SolBalance";
 import { Account, useFetchAccountInfo } from "providers/accounts";
 import { Address } from "components/common/Address";
 import {
@@ -195,7 +195,7 @@ function SecurityLabel() {
 function LastVerifiedBuildLabel() {
   return (
     <InfoTooltip text="Indicates whether the program currently deployed on-chain is verified to match the associated published source code, when it is available.">
-      Verifiable Build Status
+      Verifiable Build Status (experimental)
     </InfoTooltip>
   );
 }

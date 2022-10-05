@@ -6,6 +6,7 @@ use {
     serial_test::serial,
     solana_gossip::{
         cluster_info,
+        cluster_info_metrics::GossipStats,
         contact_info::ContactInfo,
         crds::GossipRoute,
         crds_gossip::*,
@@ -52,8 +53,9 @@ impl Node {
         stake: u64,
     ) -> Self {
         let ping_cache = Arc::new(Mutex::new(PingCache::new(
-            Duration::from_secs(20 * 60), // ttl
-            2048,                         // capacity
+            Duration::from_secs(20 * 60),      // ttl
+            Duration::from_secs(20 * 60) / 64, // delay
+            2048,                              // capacity
         )));
         Node {
             keypair,
@@ -489,9 +491,9 @@ fn network_run_pull(
         let requests: Vec<_> = {
             network_values
                 .par_iter()
-                .filter_map(|from| {
+                .flat_map_iter(|from| {
                     let mut pings = Vec::new();
-                    let (peer, filters) = from
+                    let requests = from
                         .gossip
                         .new_pull_request(
                             thread_pool,
@@ -505,12 +507,14 @@ fn network_run_pull(
                             &mut pings,
                             &SocketAddrSpace::Unspecified,
                         )
-                        .ok()?;
+                        .unwrap_or_default();
                     let from_pubkey = from.keypair.pubkey();
                     let label = CrdsValueLabel::ContactInfo(from_pubkey);
                     let gossip_crds = from.gossip.crds.read().unwrap();
                     let self_info = gossip_crds.get::<&CrdsValue>(&label).unwrap().clone();
-                    Some((peer.id, filters, self_info))
+                    requests
+                        .into_iter()
+                        .map(move |(peer, filters)| (peer.id, filters, self_info.clone()))
                 })
                 .collect()
         };
@@ -541,6 +545,7 @@ fn network_run_pull(
                                 &filters,
                                 usize::MAX, // output_size_limit
                                 now,
+                                &GossipStats::default(),
                             )
                             .into_iter()
                             .flatten()
@@ -604,7 +609,7 @@ fn network_run_pull(
 fn build_gossip_thread_pool() -> ThreadPool {
     ThreadPoolBuilder::new()
         .num_threads(get_thread_count().min(2))
-        .thread_name(|i| format!("crds_gossip_test_{}", i))
+        .thread_name(|i| format!("gossipTest{:02}", i))
         .build()
         .unwrap()
 }

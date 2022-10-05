@@ -22,8 +22,10 @@ pub struct TransactionCost {
     pub signature_cost: u64,
     pub write_lock_cost: u64,
     pub data_bytes_cost: u64,
-    pub execution_cost: u64,
+    pub builtins_execution_cost: u64,
+    pub bpf_execution_cost: u64,
     pub account_data_size: u64,
+    pub is_simple_vote: bool,
 }
 
 impl Default for TransactionCost {
@@ -33,8 +35,10 @@ impl Default for TransactionCost {
             signature_cost: 0u64,
             write_lock_cost: 0u64,
             data_bytes_cost: 0u64,
-            execution_cost: 0u64,
+            builtins_execution_cost: 0u64,
+            bpf_execution_cost: 0u64,
             account_data_size: 0u64,
+            is_simple_vote: false,
         }
     }
 }
@@ -52,11 +56,21 @@ impl TransactionCost {
         self.signature_cost = 0;
         self.write_lock_cost = 0;
         self.data_bytes_cost = 0;
-        self.execution_cost = 0;
+        self.builtins_execution_cost = 0;
+        self.bpf_execution_cost = 0;
+        self.is_simple_vote = false;
     }
 
     pub fn sum(&self) -> u64 {
-        self.signature_cost + self.write_lock_cost + self.data_bytes_cost + self.execution_cost
+        self.sum_without_bpf()
+            .saturating_add(self.bpf_execution_cost)
+    }
+
+    pub fn sum_without_bpf(&self) -> u64 {
+        self.signature_cost
+            .saturating_add(self.write_lock_cost)
+            .saturating_add(self.data_bytes_cost)
+            .saturating_add(self.builtins_execution_cost)
     }
 }
 
@@ -76,7 +90,6 @@ impl CostModel {
         cost_table
             .iter()
             .map(|(key, cost)| (key, cost))
-            .chain(BUILT_IN_INSTRUCTION_COSTS.iter())
             .for_each(|(program_id, cost)| {
                 self.upsert_instruction_cost(program_id, *cost);
             });
@@ -87,9 +100,9 @@ impl CostModel {
 
         tx_cost.signature_cost = self.get_signature_cost(transaction);
         self.get_write_lock_cost(&mut tx_cost, transaction);
-        tx_cost.data_bytes_cost = self.get_data_bytes_cost(transaction);
-        tx_cost.execution_cost = self.get_transaction_cost(transaction);
+        self.get_transaction_cost(&mut tx_cost, transaction);
         tx_cost.account_data_size = self.calculate_account_data_size(transaction);
+        tx_cost.is_simple_vote = transaction.is_simple_vote_transaction();
 
         debug!("transaction {:?} has cost {:?}", transaction, tx_cost);
         tx_cost
@@ -104,7 +117,9 @@ impl CostModel {
         match self.instruction_execution_cost_table.get_cost(program_key) {
             Some(cost) => *cost,
             None => {
-                let default_value = self.instruction_execution_cost_table.get_default_units();
+                let default_value = self
+                    .instruction_execution_cost_table
+                    .get_default_compute_unit_limit();
                 debug!(
                     "Program {:?} does not have aggregated cost, using default value {}",
                     program_key, default_value
@@ -138,30 +153,34 @@ impl CostModel {
             });
     }
 
-    fn get_data_bytes_cost(&self, transaction: &SanitizedTransaction) -> u64 {
-        let mut data_bytes_cost: u64 = 0;
-        transaction
-            .message()
-            .program_instructions_iter()
-            .for_each(|(_, ix)| {
-                data_bytes_cost += ix.data.len() as u64 / DATA_BYTES_UNITS;
-            });
-        data_bytes_cost
-    }
-
-    fn get_transaction_cost(&self, transaction: &SanitizedTransaction) -> u64 {
-        let mut cost: u64 = 0;
+    fn get_transaction_cost(
+        &self,
+        tx_cost: &mut TransactionCost,
+        transaction: &SanitizedTransaction,
+    ) {
+        let mut builtin_costs = 0u64;
+        let mut bpf_costs = 0u64;
+        let mut data_bytes_len_total = 0u64;
 
         for (program_id, instruction) in transaction.message().program_instructions_iter() {
-            let instruction_cost = self.find_instruction_cost(program_id);
-            trace!(
-                "instruction {:?} has cost of {}",
-                instruction,
-                instruction_cost
-            );
-            cost = cost.saturating_add(instruction_cost);
+            // to keep the same behavior, look for builtin first
+            if let Some(builtin_cost) = BUILT_IN_INSTRUCTION_COSTS.get(program_id) {
+                builtin_costs = builtin_costs.saturating_add(*builtin_cost);
+            } else {
+                let instruction_cost = self.find_instruction_cost(program_id);
+                trace!(
+                    "instruction {:?} has cost of {}",
+                    instruction,
+                    instruction_cost
+                );
+                bpf_costs = bpf_costs.saturating_add(instruction_cost);
+            }
+            data_bytes_len_total =
+                data_bytes_len_total.saturating_add(instruction.data.len() as u64);
         }
-        cost
+        tx_cost.builtins_execution_cost = builtin_costs;
+        tx_cost.bpf_execution_cost = bpf_costs;
+        tx_cost.data_bytes_cost = data_bytes_len_total / INSTRUCTION_DATA_BYTES_COST;
     }
 
     fn calculate_account_data_size_on_deserialized_system_instruction(
@@ -269,7 +288,9 @@ mod tests {
 
         // unknown program is assigned with default cost
         assert_eq!(
-            testee.instruction_execution_cost_table.get_default_units(),
+            testee
+                .instruction_execution_cost_table
+                .get_default_compute_unit_limit(),
             testee.find_instruction_cost(
                 &Pubkey::from_str("unknown111111111111111111111111111111111111").unwrap()
             )
@@ -337,14 +358,16 @@ mod tests {
         );
 
         // expected cost for one system transfer instructions
-        let expected_cost = 8;
+        let expected_execution_cost = BUILT_IN_INSTRUCTION_COSTS
+            .get(&system_program::id())
+            .unwrap();
 
-        let mut testee = CostModel::default();
-        testee.upsert_instruction_cost(&system_program::id(), expected_cost);
-        assert_eq!(
-            expected_cost,
-            testee.get_transaction_cost(&simple_transaction)
-        );
+        let testee = CostModel::default();
+        let mut tx_cost = TransactionCost::default();
+        testee.get_transaction_cost(&mut tx_cost, &simple_transaction);
+        assert_eq!(*expected_execution_cost, tx_cost.builtins_execution_cost);
+        assert_eq!(0, tx_cost.bpf_execution_cost);
+        assert_eq!(3, tx_cost.data_bytes_cost);
     }
 
     #[test]
@@ -364,12 +387,17 @@ mod tests {
         debug!("many transfer transaction {:?}", tx);
 
         // expected cost for two system transfer instructions
-        let program_cost = 8;
+        let program_cost = BUILT_IN_INSTRUCTION_COSTS
+            .get(&system_program::id())
+            .unwrap();
         let expected_cost = program_cost * 2;
 
-        let mut testee = CostModel::default();
-        testee.upsert_instruction_cost(&system_program::id(), program_cost);
-        assert_eq!(expected_cost, testee.get_transaction_cost(&tx));
+        let testee = CostModel::default();
+        let mut tx_cost = TransactionCost::default();
+        testee.get_transaction_cost(&mut tx_cost, &tx);
+        assert_eq!(expected_cost, tx_cost.builtins_execution_cost);
+        assert_eq!(0, tx_cost.bpf_execution_cost);
+        assert_eq!(6, tx_cost.data_bytes_cost);
     }
 
     #[test]
@@ -397,11 +425,15 @@ mod tests {
         debug!("many random transaction {:?}", tx);
 
         let testee = CostModel::default();
-        let result = testee.get_transaction_cost(&tx);
-
-        // expected cost for two random/unknown program is
-        let expected_cost = testee.instruction_execution_cost_table.get_default_units() * 2;
-        assert_eq!(expected_cost, result);
+        let expected_cost = testee
+            .instruction_execution_cost_table
+            .get_default_compute_unit_limit()
+            * 2;
+        let mut tx_cost = TransactionCost::default();
+        testee.get_transaction_cost(&mut tx_cost, &tx);
+        assert_eq!(0, tx_cost.builtins_execution_cost);
+        assert_eq!(expected_cost, tx_cost.bpf_execution_cost);
+        assert_eq!(0, tx_cost.data_bytes_cost);
     }
 
     #[test]
@@ -446,7 +478,7 @@ mod tests {
         assert_eq!(
             cost_model
                 .instruction_execution_cost_table
-                .get_default_units(),
+                .get_default_compute_unit_limit(),
             cost_model.find_instruction_cost(&key1)
         );
 
@@ -468,13 +500,14 @@ mod tests {
         ));
 
         let expected_account_cost = WRITE_LOCK_UNITS * 2;
-        let expected_execution_cost = 8;
+        let expected_execution_cost = BUILT_IN_INSTRUCTION_COSTS
+            .get(&system_program::id())
+            .unwrap();
 
-        let mut cost_model = CostModel::default();
-        cost_model.upsert_instruction_cost(&system_program::id(), expected_execution_cost);
+        let cost_model = CostModel::default();
         let tx_cost = cost_model.calculate_cost(&tx);
         assert_eq!(expected_account_cost, tx_cost.write_lock_cost);
-        assert_eq!(expected_execution_cost, tx_cost.execution_cost);
+        assert_eq!(*expected_execution_cost, tx_cost.builtins_execution_cost);
         assert_eq!(2, tx_cost.writable_accounts.len());
     }
 
@@ -571,14 +604,14 @@ mod tests {
             assert_eq!(*cost, cost_model.find_instruction_cost(id));
         }
 
-        // verify built-in programs
+        // verify built-in programs are not in bpf_costs
         assert!(cost_model
             .instruction_execution_cost_table
             .get_cost(&system_program::id())
-            .is_some());
+            .is_none());
         assert!(cost_model
             .instruction_execution_cost_table
             .get_cost(&solana_vote_program::id())
-            .is_some());
+            .is_none());
     }
 }

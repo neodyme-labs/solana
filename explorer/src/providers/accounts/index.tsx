@@ -1,6 +1,12 @@
 import React from "react";
 import { pubkeyToString } from "utils";
-import { PublicKey, Connection, StakeActivationData } from "@solana/web3.js";
+import {
+  PublicKey,
+  Connection,
+  StakeActivationData,
+  AddressLookupTableAccount,
+  AddressLookupTableProgram,
+} from "@solana/web3.js";
 import { useCluster, Cluster } from "../cluster";
 import { HistoryProvider } from "./history";
 import { TokensProvider } from "./tokens";
@@ -19,6 +25,7 @@ import { VoteAccount } from "validators/accounts/vote";
 import { NonceAccount } from "validators/accounts/nonce";
 import { SysvarAccount } from "validators/accounts/sysvar";
 import { ConfigAccount } from "validators/accounts/config";
+import { ParsedAddressLookupTableAccount } from "validators/accounts/address-lookup-table";
 import { FlaggedAccountsProvider } from "./flagged-accounts";
 import {
   ProgramDataAccount,
@@ -76,6 +83,11 @@ export type ConfigProgramData = {
   parsed: ConfigAccount;
 };
 
+export type AddressLookupTableProgramData = {
+  program: "address-lookup-table";
+  parsed: ParsedAddressLookupTableAccount;
+};
+
 export type ProgramData =
   | UpgradeableLoaderAccountData
   | StakeProgramData
@@ -83,13 +95,15 @@ export type ProgramData =
   | VoteProgramData
   | NonceProgramData
   | SysvarProgramData
-  | ConfigProgramData;
+  | ConfigProgramData
+  | AddressLookupTableProgramData;
 
 export interface Details {
   executable: boolean;
   owner: PublicKey;
   space: number;
   data?: ProgramData;
+  rawData?: Buffer;
 }
 
 export interface Account {
@@ -237,6 +251,17 @@ async function fetchAccountInfo(
               };
               break;
 
+            case "address-lookup-table": {
+              const parsed = create(info, ParsedAddressLookupTableAccount);
+
+              data = {
+                program: result.data.program,
+                parsed,
+              };
+
+              break;
+            }
+
             case "spl-token":
               const parsed = create(info, TokenAccount);
               let nftData;
@@ -284,11 +309,19 @@ async function fetchAccountInfo(
         }
       }
 
+      // If we cannot parse account layout as native spl account
+      // then keep raw data for other components to decode
+      let rawData: Buffer | undefined;
+      if (!data && !("parsed" in result.data)) {
+        rawData = result.data;
+      }
+
       details = {
         space,
         executable: result.executable,
         owner: result.owner,
         data,
+        rawData,
       };
     }
     data = { pubkey, lamports, details };
@@ -308,6 +341,8 @@ async function fetchAccountInfo(
   });
 }
 
+const IMAGE_MIME_TYPE_REGEX = /data:image\/(svg\+xml|png|jpeg|gif)/g;
+
 const getMetaDataJSON = async (
   id: string,
   metadata: programs.metadata.MetadataData
@@ -322,9 +357,11 @@ const getMetaDataJSON = async (
       }
 
       if (extended?.image) {
-        extended.image = extended.image.startsWith("http")
-          ? extended.image
-          : `${metadata.data.uri}/${extended.image}`;
+        extended.image =
+          extended.image.startsWith("http") ||
+          IMAGE_MIME_TYPE_REGEX.test(extended.image)
+            ? extended.image
+            : `${metadata.data.uri}/${extended.image}`;
       }
 
       return extended;
@@ -413,6 +450,40 @@ export function useTokenAccountInfo(
   } catch (err) {
     reportError(err, { address });
   }
+}
+
+export function useAddressLookupTable(
+  address: string | undefined
+): AddressLookupTableAccount | undefined | string {
+  const accountInfo = useAccountInfo(address);
+  if (address === undefined) return;
+  if (accountInfo?.data?.details === undefined) return;
+  if (accountInfo.data.lamports === 0) return "Lookup Table Not Found";
+  const { data, rawData } = accountInfo.data.details;
+
+  const key = new PublicKey(address);
+  if (data && data.program === "address-lookup-table") {
+    if (data.parsed.type === "lookupTable") {
+      return new AddressLookupTableAccount({
+        key,
+        state: data.parsed.info,
+      });
+    } else if (data.parsed.type === "uninitialized") {
+      return "Lookup Table Uninitialized";
+    }
+  } else if (
+    rawData &&
+    accountInfo.data.details.owner.equals(AddressLookupTableProgram.programId)
+  ) {
+    try {
+      return new AddressLookupTableAccount({
+        key,
+        state: AddressLookupTableAccount.deserialize(rawData),
+      });
+    } catch {}
+  }
+
+  return "Invalid Lookup Table";
 }
 
 export function useFetchAccountInfo() {

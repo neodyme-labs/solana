@@ -1,16 +1,24 @@
 use {
     crate::{accounts_db::SnapshotStorages, ancestors::Ancestors, rent_collector::RentCollector},
+    core::ops::Range,
     log::*,
     rayon::prelude::*,
     solana_measure::measure::Measure,
     solana_sdk::{
         hash::{Hash, Hasher},
         pubkey::Pubkey,
+        slot_history::Slot,
         sysvar::epoch_schedule::EpochSchedule,
     },
-    std::{borrow::Borrow, convert::TryInto, sync::Mutex},
+    std::{
+        borrow::Borrow,
+        convert::TryInto,
+        sync::{
+            atomic::{AtomicU64, AtomicUsize, Ordering},
+            Mutex,
+        },
+    },
 };
-pub const ZERO_RAW_LAMPORTS_SENTINEL: u64 = std::u64::MAX;
 pub const MERKLE_FANOUT: usize = 16;
 
 #[derive(Default, Debug)]
@@ -18,6 +26,15 @@ pub struct PreviousPass {
     pub reduced_hashes: Vec<Vec<Hash>>,
     pub remaining_unhashed: Vec<Hash>,
     pub lamports: u64,
+}
+
+#[derive(Debug)]
+#[allow(dead_code)]
+pub struct FullSnapshotAccountsHashInfo {
+    /// accounts hash over all accounts when the full snapshot was taken
+    hash: Hash,
+    /// slot where full snapshot was taken
+    slot: Slot,
 }
 
 /// parameters to calculate accounts hash
@@ -28,14 +45,27 @@ pub struct CalcAccountsHashConfig<'a> {
     /// verify every hash in append vec/write cache with a recalculated hash
     /// this option will be removed
     pub check_hash: bool,
-    /// 'ancestors' is used to get storages and also used if 'use_write_cache' is true to
-    /// get account data from the write cache
+    /// 'ancestors' is used to get storages
     pub ancestors: Option<&'a Ancestors>,
     /// does hash calc need to consider account data that exists in the write cache?
     /// if so, 'ancestors' will be used for this purpose as well as storages.
-    pub use_write_cache: bool,
     pub epoch_schedule: &'a EpochSchedule,
     pub rent_collector: &'a RentCollector,
+    /// used for tracking down hash mismatches after the fact
+    pub store_detailed_debug_info_on_failure: bool,
+    /// true if hash calculation can rehash based on skipped rewrites
+    pub enable_rehashing: bool,
+    /// `Some` if this is an incremental snapshot which only hashes slots since the base full snapshot
+    pub full_snapshot: Option<FullSnapshotAccountsHashInfo>,
+}
+
+impl<'a> CalcAccountsHashConfig<'a> {
+    /// return true if we should cache accounts hash intermediate data between calls
+    pub fn get_should_cache_hash_data() -> bool {
+        // when we are skipping rewrites, we cannot rely on the cached data from old append vecs, so we have to disable caching for now
+        // skipping rewrites is not enabled in this branch. It requires a cli argument.
+        true
+    }
 }
 
 // smallest, 3 quartiles, largest, average
@@ -43,6 +73,7 @@ pub type StorageSizeQuartileStats = [usize; 6];
 
 #[derive(Debug, Default)]
 pub struct HashStats {
+    pub mark_time_us: u64,
     pub scan_time_total_us: u64,
     pub zeros_time_total_us: u64,
     pub hash_time_total_us: u64,
@@ -52,11 +83,26 @@ pub struct HashStats {
     pub unreduced_entries: usize,
     pub num_snapshot_storage: usize,
     pub num_slots: usize,
+    pub num_dirty_slots: usize,
     pub collect_snapshots_us: u64,
     pub storage_sort_us: u64,
     pub min_bin_size: usize,
     pub max_bin_size: usize,
     pub storage_size_quartiles: StorageSizeQuartileStats,
+    /// time spent hashing during rehash calls
+    pub rehash_hash_us: AtomicU64,
+    /// time spent determining whether to rehash during rehash calls
+    pub rehash_calc_us: AtomicU64,
+    /// # rehashes that took place and were necessary
+    pub rehash_required: AtomicUsize,
+    /// # rehashes that took place and were UNnecessary
+    pub rehash_unnecessary: AtomicUsize,
+    pub oldest_root: Slot,
+    pub roots_older_than_epoch: AtomicUsize,
+    pub accounts_in_roots_older_than_epoch: AtomicUsize,
+    pub append_vec_sizes_older_than_epoch: AtomicUsize,
+    /// # ancient append vecs encountered
+    pub ancient_append_vecs: AtomicUsize,
 }
 impl HashStats {
     pub fn calc_storage_size_quartiles(&mut self, storages: &SnapshotStorages) {
@@ -91,7 +137,7 @@ impl HashStats {
         };
     }
 
-    fn log(&mut self) {
+    pub fn log(&mut self) {
         let total_time_us = self.scan_time_total_us
             + self.zeros_time_total_us
             + self.hash_time_total_us
@@ -99,9 +145,10 @@ impl HashStats {
             + self.storage_sort_us;
         datapoint_info!(
             "calculate_accounts_hash_without_index",
-            ("accounts_scan", self.scan_time_total_us, i64),
-            ("eliminate_zeros", self.zeros_time_total_us, i64),
-            ("hash", self.hash_time_total_us, i64),
+            ("mark_time_us", self.mark_time_us, i64),
+            ("accounts_scan_us", self.scan_time_total_us, i64),
+            ("eliminate_zeros_us", self.zeros_time_total_us, i64),
+            ("hash_us", self.hash_time_total_us, i64),
             ("hash_time_pre_us", self.hash_time_pre_us, i64),
             ("sort", self.sort_time_total_us, i64),
             ("hash_total", self.hash_total, i64),
@@ -118,6 +165,7 @@ impl HashStats {
                 i64
             ),
             ("num_slots", self.num_slots as i64, i64),
+            ("num_dirty_slots", self.num_dirty_slots as i64, i64),
             ("min_bin_size", self.min_bin_size as i64, i64),
             ("max_bin_size", self.max_bin_size as i64, i64),
             (
@@ -150,12 +198,59 @@ impl HashStats {
                 self.storage_size_quartiles[5] as i64,
                 i64
             ),
-            ("total", total_time_us as i64, i64),
+            ("total_us", total_time_us as i64, i64),
+            (
+                "rehashed_rewrites",
+                self.rehash_required.load(Ordering::Relaxed) as i64,
+                i64
+            ),
+            (
+                "rehash_hash_us",
+                self.rehash_hash_us.load(Ordering::Relaxed) as i64,
+                i64
+            ),
+            (
+                "rehash_calc_us",
+                self.rehash_calc_us.load(Ordering::Relaxed) as i64,
+                i64
+            ),
+            (
+                "rehashed_rewrites_unnecessary",
+                self.rehash_unnecessary.load(Ordering::Relaxed) as i64,
+                i64
+            ),
+            (
+                "roots_older_than_epoch",
+                self.roots_older_than_epoch.load(Ordering::Relaxed) as i64,
+                i64
+            ),
+            ("oldest_root", self.oldest_root as i64, i64),
+            (
+                "ancient_append_vecs",
+                self.ancient_append_vecs.load(Ordering::Relaxed) as i64,
+                i64
+            ),
+            (
+                "append_vec_sizes_older_than_epoch",
+                self.append_vec_sizes_older_than_epoch
+                    .load(Ordering::Relaxed) as i64,
+                i64
+            ),
+            (
+                "accounts_in_roots_older_than_epoch",
+                self.accounts_in_roots_older_than_epoch
+                    .load(Ordering::Relaxed) as i64,
+                i64
+            ),
         );
     }
 }
 
-#[derive(Default, Debug, PartialEq, Clone)]
+/// While scanning appendvecs, this is the info that needs to be extracted, de-duped, and sorted from what is stored in an append vec.
+/// Note this can be saved/loaded during hash calculation to a memory mapped file whose contents are
+/// [CalculateHashIntermediate]
+#[repr(C)]
+#[derive(Default, Debug, PartialEq, Eq, Clone)]
 pub struct CalculateHashIntermediate {
     pub hash: Hash,
     pub lamports: u64,
@@ -172,7 +267,7 @@ impl CalculateHashIntermediate {
     }
 }
 
-#[derive(Default, Debug, PartialEq)]
+#[derive(Default, Debug, PartialEq, Eq)]
 pub struct CumulativeOffset {
     pub index: Vec<usize>,
     pub start_offset: usize,
@@ -597,6 +692,55 @@ impl AccountsHash {
             .expect("overflow is detected while summing capitalization")
     }
 
+    /// return references to cache hash data, grouped by bin, sourced from 'sorted_data_by_pubkey',
+    /// which is probably a mmapped file.
+    #[allow(dead_code)]
+    fn get_binned_data<'a>(
+        sorted_data_by_pubkey: &'a Vec<&'a [CalculateHashIntermediate]>,
+        bins: usize,
+        bin_range: &Range<usize>,
+    ) -> Vec<Vec<&'a [CalculateHashIntermediate]>> {
+        // get slices per bin from each slice
+        use crate::pubkey_bins::PubkeyBinCalculator24;
+        let binner = PubkeyBinCalculator24::new(bins);
+        sorted_data_by_pubkey
+            .par_iter()
+            .map(|all_bins| {
+                let mut last_start_index = 0;
+                let mut result = Vec::with_capacity(bin_range.len());
+                let mut current_bin = bin_range.start;
+                let max_inclusive = all_bins.len();
+                for i in 0..=max_inclusive {
+                    let this_bin = if i != max_inclusive {
+                        let entry = &all_bins[i];
+                        let this_bin = binner.bin_from_pubkey(&entry.pubkey);
+                        if this_bin == current_bin {
+                            // this pk is in the same bin as we're currently investigating, so keep iterating
+                            continue;
+                        }
+                        this_bin
+                    } else {
+                        // we exhausted the source data, so 'this bin' is now the end (exclusive) bin
+                        // this case exists to handle the +1 case
+                        bin_range.end
+                    };
+                    // we found the first pubkey in the bin after the bin we were investigating
+                    // or we passed the end of the input list.
+                    // So, the bin we were investigating is now complete.
+                    result.push(&all_bins[last_start_index..i]);
+                    last_start_index = i;
+                    ((current_bin + 1)..this_bin).for_each(|_| {
+                        // the source data could contain a pubey from bin 1, then bin 5, skipping the bins in between.
+                        // In that case, fill in 2..5 with empty
+                        result.push(&all_bins[0..0]); // empty slice
+                    });
+                    current_bin = this_bin;
+                }
+                result
+            })
+            .collect::<Vec<_>>()
+    }
+
     fn de_dup_and_eliminate_zeros<'a>(
         &self,
         sorted_data_by_pubkey: &'a [Vec<Vec<CalculateHashIntermediate>>],
@@ -758,7 +902,7 @@ impl AccountsHash {
             );
 
             // add lamports, get hash as long as the lamports are > 0
-            if item.lamports != ZERO_RAW_LAMPORTS_SENTINEL
+            if item.lamports != 0
                 && (!filler_accounts_enabled || !self.is_filler_account(&item.pubkey))
             {
                 overall_sum = Self::checked_cast_for_capitalization(
@@ -909,10 +1053,6 @@ impl AccountsHash {
         } else {
             Hash::default()
         };
-
-        if is_last_pass {
-            stats.log();
-        }
         (hash, total_lamports, next_pass)
     }
 }
@@ -937,9 +1077,9 @@ pub mod tests {
     }
 
     fn for_rest(
-        original: Vec<CalculateHashIntermediate>,
+        original: &[CalculateHashIntermediate],
     ) -> Vec<Vec<Vec<CalculateHashIntermediate>>> {
-        vec![vec![original]]
+        vec![vec![original.to_vec()]]
     }
 
     #[test]
@@ -956,12 +1096,12 @@ pub mod tests {
         // 2nd key - zero lamports, so will be removed
         let key = Pubkey::new(&[12u8; 32]);
         let hash = Hash::new(&[2u8; 32]);
-        let val = CalculateHashIntermediate::new(hash, ZERO_RAW_LAMPORTS_SENTINEL, key);
+        let val = CalculateHashIntermediate::new(hash, 0, key);
         account_maps.push(val);
 
         let accounts_hash = AccountsHash::default();
         let result = accounts_hash.rest_of_hash_calculation(
-            for_rest(account_maps.clone()),
+            for_rest(&account_maps),
             &mut HashStats::default(),
             true,
             PreviousPass::default(),
@@ -977,7 +1117,7 @@ pub mod tests {
         account_maps.insert(0, val);
 
         let result = accounts_hash.rest_of_hash_calculation(
-            for_rest(account_maps.clone()),
+            for_rest(&account_maps),
             &mut HashStats::default(),
             true,
             PreviousPass::default(),
@@ -993,7 +1133,7 @@ pub mod tests {
         account_maps.insert(1, val);
 
         let result = accounts_hash.rest_of_hash_calculation(
-            for_rest(account_maps),
+            for_rest(&account_maps),
             &mut HashStats::default(),
             true,
             PreviousPass::default(),
@@ -1009,6 +1149,10 @@ pub mod tests {
 
     fn zero_range() -> usize {
         0
+    }
+
+    fn empty_data() -> Vec<Vec<Vec<CalculateHashIntermediate>>> {
+        vec![vec![vec![]]]
     }
 
     #[test]
@@ -1030,7 +1174,7 @@ pub mod tests {
             // 2nd key - zero lamports, so will be removed
             let key = Pubkey::new(&[12u8; 32]);
             let hash = Hash::new(&[2u8; 32]);
-            let val = CalculateHashIntermediate::new(hash, ZERO_RAW_LAMPORTS_SENTINEL, key);
+            let val = CalculateHashIntermediate::new(hash, 0, key);
             account_maps.push(val);
 
             let mut previous_pass = PreviousPass::default();
@@ -1039,7 +1183,7 @@ pub mod tests {
             if pass == 0 {
                 // first pass that is not last and is empty
                 let result = accounts_index.rest_of_hash_calculation(
-                    vec![vec![vec![]]],
+                    empty_data(),
                     &mut HashStats::default(),
                     false, // not last pass
                     previous_pass,
@@ -1054,7 +1198,7 @@ pub mod tests {
             }
 
             let result = accounts_index.rest_of_hash_calculation(
-                for_rest(account_maps.clone()),
+                for_rest(&account_maps),
                 &mut HashStats::default(),
                 false, // not last pass
                 previous_pass,
@@ -1073,7 +1217,7 @@ pub mod tests {
             let accounts_index = AccountsHash::default();
             if pass == 2 {
                 let result = accounts_index.rest_of_hash_calculation(
-                    vec![vec![vec![]]],
+                    empty_data(),
                     &mut HashStats::default(),
                     false,
                     previous_pass,
@@ -1087,7 +1231,7 @@ pub mod tests {
             }
 
             let result = accounts_index.rest_of_hash_calculation(
-                vec![vec![vec![]]],
+                empty_data(),
                 &mut HashStats::default(),
                 true, // finally, last pass
                 previous_pass,
@@ -1120,7 +1264,7 @@ pub mod tests {
         account_maps.push(val);
         let accounts_hash = AccountsHash::default();
         let result = accounts_hash.rest_of_hash_calculation(
-            for_rest(vec![account_maps[0].clone()]),
+            for_rest(&[account_maps[0].clone()]),
             &mut HashStats::default(),
             false, // not last pass
             PreviousPass::default(),
@@ -1135,7 +1279,7 @@ pub mod tests {
         assert_eq!(previous_pass.lamports, account_maps[0].lamports);
 
         let result = accounts_hash.rest_of_hash_calculation(
-            for_rest(vec![account_maps[1].clone()]),
+            for_rest(&[account_maps[1].clone()]),
             &mut HashStats::default(),
             false, // not last pass
             previous_pass,
@@ -1154,7 +1298,7 @@ pub mod tests {
         assert_eq!(previous_pass.lamports, total_lamports_expected);
 
         let result = accounts_hash.rest_of_hash_calculation(
-            vec![vec![vec![]]],
+            empty_data(),
             &mut HashStats::default(),
             true,
             previous_pass,
@@ -1206,7 +1350,7 @@ pub mod tests {
 
         // first 4097 hashes (1 left over)
         let result = accounts_hash.rest_of_hash_calculation(
-            for_rest(chunk),
+            for_rest(&chunk),
             &mut HashStats::default(),
             false, // not last pass
             PreviousPass::default(),
@@ -1251,7 +1395,7 @@ pub mod tests {
 
         // second 4097 hashes (2 left over)
         let result = accounts_hash.rest_of_hash_calculation(
-            for_rest(chunk),
+            for_rest(&chunk),
             &mut HashStats::default(),
             false, // not last pass
             previous_pass,
@@ -1279,7 +1423,7 @@ pub mod tests {
         );
 
         let result = accounts_hash.rest_of_hash_calculation(
-            vec![vec![vec![]]],
+            empty_data(),
             &mut HashStats::default(),
             true,
             previous_pass,
@@ -1309,10 +1453,13 @@ pub mod tests {
 
     #[test]
     fn test_accountsdb_de_dup_accounts_zero_chunks() {
-        let vec = [vec![vec![CalculateHashIntermediate::default()]]];
+        let vec = [vec![vec![CalculateHashIntermediate {
+            lamports: 1,
+            ..CalculateHashIntermediate::default()
+        }]]];
         let (hashes, lamports, _) = AccountsHash::default().de_dup_accounts_in_parallel(&vec, 0);
         assert_eq!(vec![&Hash::default()], hashes);
-        assert_eq!(lamports, 0);
+        assert_eq!(lamports, 1);
     }
 
     #[test]
@@ -1567,7 +1714,7 @@ pub mod tests {
         assert_eq!(result, (vec![&val.hash], val.lamports as u64, 1));
 
         // zero original lamports, higher version
-        let val = CalculateHashIntermediate::new(hash, ZERO_RAW_LAMPORTS_SENTINEL, key);
+        let val = CalculateHashIntermediate::new(hash, 0, key);
         account_maps.push(val); // has to be after previous entry since account_maps are in slot order
 
         let vecs = vec![vec![account_maps.to_vec()]];
@@ -1967,5 +2114,43 @@ pub mod tests {
             &mut HashStats::default(),
             2, // accounts above are in 2 groups
         );
+    }
+
+    #[test]
+    fn test_get_binned_data() {
+        let data = [CalculateHashIntermediate::new(
+            Hash::default(),
+            1,
+            Pubkey::new(&[1u8; 32]),
+        )];
+        let data2 = vec![&data[..]];
+        let bins = 1;
+        let result = AccountsHash::get_binned_data(&data2, bins, &(0..bins));
+        assert_eq!(result, vec![vec![&data[..]]]);
+        let bins = 2;
+        let result = AccountsHash::get_binned_data(&data2, bins, &(0..bins));
+        assert_eq!(result, vec![vec![&data[..], &data[0..0]]]);
+        let data = [CalculateHashIntermediate::new(
+            Hash::default(),
+            1,
+            Pubkey::new(&[255u8; 32]),
+        )];
+        let data2 = vec![&data[..]];
+        let result = AccountsHash::get_binned_data(&data2, bins, &(0..bins));
+        assert_eq!(result, vec![vec![&data[0..0], &data[..]]]);
+        let data = [
+            CalculateHashIntermediate::new(Hash::default(), 1, Pubkey::new(&[254u8; 32])),
+            CalculateHashIntermediate::new(Hash::default(), 1, Pubkey::new(&[255u8; 32])),
+        ];
+        let data2 = vec![&data[..]];
+        let result = AccountsHash::get_binned_data(&data2, bins, &(0..bins));
+        assert_eq!(result, vec![vec![&data[0..0], &data[..]]]);
+        let data = [
+            CalculateHashIntermediate::new(Hash::default(), 1, Pubkey::new(&[1u8; 32])),
+            CalculateHashIntermediate::new(Hash::default(), 1, Pubkey::new(&[255u8; 32])),
+        ];
+        let data2 = vec![&data[..]];
+        let result = AccountsHash::get_binned_data(&data2, bins, &(0..bins));
+        assert_eq!(result, vec![vec![&data[0..1], &data[1..2]]]);
     }
 }

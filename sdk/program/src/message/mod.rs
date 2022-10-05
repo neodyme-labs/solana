@@ -40,19 +40,20 @@
 mod compiled_keys;
 pub mod legacy;
 
-#[cfg(not(target_arch = "bpf"))]
+#[cfg(not(target_os = "solana"))]
 #[path = ""]
 mod non_bpf_modules {
     mod account_keys;
+    mod address_loader;
     mod sanitized;
     mod versions;
 
-    pub use {account_keys::*, sanitized::*, versions::*};
+    pub use {account_keys::*, address_loader::*, sanitized::*, versions::*};
 }
 
 use compiled_keys::*;
 pub use legacy::Message;
-#[cfg(not(target_arch = "bpf"))]
+#[cfg(not(target_os = "solana"))]
 pub use non_bpf_modules::*;
 
 /// The length of a message header in bytes.

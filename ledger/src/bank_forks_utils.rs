@@ -9,21 +9,26 @@ use {
     },
     log::*,
     solana_runtime::{
+        accounts_background_service::AbsRequestSender,
         accounts_update_notifier_interface::AccountsUpdateNotifier,
         bank_forks::BankForks,
         snapshot_archive_info::SnapshotArchiveInfoGetter,
         snapshot_config::SnapshotConfig,
         snapshot_hash::{FullSnapshotHash, IncrementalSnapshotHash, StartingSnapshotHashes},
-        snapshot_package::AccountsPackageSender,
         snapshot_utils,
     },
     solana_sdk::genesis_config::GenesisConfig,
-    std::{fs, path::PathBuf, process, result},
+    std::{
+        fs,
+        path::PathBuf,
+        process, result,
+        sync::{atomic::AtomicBool, Arc, RwLock},
+    },
 };
 
 pub type LoadResult = result::Result<
     (
-        BankForks,
+        Arc<RwLock<BankForks>>,
         LeaderScheduleCache,
         Option<StartingSnapshotHashes>,
     ),
@@ -44,10 +49,10 @@ pub fn load(
     process_options: ProcessOptions,
     transaction_status_sender: Option<&TransactionStatusSender>,
     cache_block_meta_sender: Option<&CacheBlockMetaSender>,
-    accounts_package_sender: AccountsPackageSender,
     accounts_update_notifier: Option<AccountsUpdateNotifier>,
+    exit: &Arc<AtomicBool>,
 ) -> LoadResult {
-    let (mut bank_forks, leader_schedule_cache, starting_snapshot_hashes) = load_bank_forks(
+    let (bank_forks, leader_schedule_cache, starting_snapshot_hashes, ..) = load_bank_forks(
         genesis_config,
         blockstore,
         account_paths,
@@ -56,17 +61,17 @@ pub fn load(
         &process_options,
         cache_block_meta_sender,
         accounts_update_notifier,
+        exit,
     );
 
     blockstore_processor::process_blockstore_from_root(
         blockstore,
-        &mut bank_forks,
+        &bank_forks,
         &leader_schedule_cache,
         &process_options,
         transaction_status_sender,
         cache_block_meta_sender,
-        snapshot_config,
-        accounts_package_sender,
+        &AbsRequestSender::default(),
     )
     .map(|_| (bank_forks, leader_schedule_cache, starting_snapshot_hashes))
 }
@@ -81,8 +86,9 @@ pub fn load_bank_forks(
     process_options: &ProcessOptions,
     cache_block_meta_sender: Option<&CacheBlockMetaSender>,
     accounts_update_notifier: Option<AccountsUpdateNotifier>,
+    exit: &Arc<AtomicBool>,
 ) -> (
-    BankForks,
+    Arc<RwLock<BankForks>>,
     LeaderScheduleCache,
     Option<StartingSnapshotHashes>,
 ) {
@@ -96,13 +102,16 @@ pub fn load_bank_forks(
             .expect("Couldn't create snapshot directory");
 
         if snapshot_utils::get_highest_full_snapshot_archive_info(
-            &snapshot_config.snapshot_archives_dir,
+            &snapshot_config.full_snapshot_archives_dir,
         )
         .is_some()
         {
             true
         } else {
-            info!("No snapshot package available; will load from genesis");
+            warn!(
+                "No snapshot package found in directory: {:?}; will load from genesis",
+                &snapshot_config.full_snapshot_archives_dir
+            );
             false
         }
     } else {
@@ -118,40 +127,45 @@ pub fn load_bank_forks(
             snapshot_config.as_ref().unwrap(),
             process_options,
             accounts_update_notifier,
+            exit,
         )
     } else {
-        if process_options
+        let maybe_filler_accounts = process_options
             .accounts_db_config
             .as_ref()
-            .and_then(|config| config.filler_account_count)
-            .unwrap_or_default()
-            > 0
-        {
+            .map(|config| config.filler_accounts_config.count > 0);
+
+        if let Some(true) = maybe_filler_accounts {
             panic!("filler accounts specified, but not loading from snapshot");
         }
 
         info!("Processing ledger from genesis");
-        (
-            blockstore_processor::process_blockstore_for_bank_0(
-                genesis_config,
-                blockstore,
-                account_paths,
-                process_options,
-                cache_block_meta_sender,
-                accounts_update_notifier,
-            ),
-            None,
-        )
+        let bank_forks = blockstore_processor::process_blockstore_for_bank_0(
+            genesis_config,
+            blockstore,
+            account_paths,
+            process_options,
+            cache_block_meta_sender,
+            accounts_update_notifier,
+            exit,
+        );
+        bank_forks
+            .read()
+            .unwrap()
+            .root_bank()
+            .set_startup_verification_complete();
+
+        (bank_forks, None)
     };
 
-    let mut leader_schedule_cache = LeaderScheduleCache::new_from_bank(&bank_forks.root_bank());
+    let mut leader_schedule_cache =
+        LeaderScheduleCache::new_from_bank(&bank_forks.read().unwrap().root_bank());
     if process_options.full_leader_cache {
         leader_schedule_cache.set_max_schedules(std::usize::MAX);
     }
 
-    assert_eq!(bank_forks.banks().len(), 1);
     if let Some(ref new_hard_forks) = process_options.new_hard_forks {
-        let root_bank = bank_forks.root_bank();
+        let root_bank = bank_forks.read().unwrap().root_bank();
         let hard_forks = root_bank.hard_forks();
 
         for hard_fork_slot in new_hard_forks.iter() {
@@ -177,7 +191,8 @@ fn bank_forks_from_snapshot(
     snapshot_config: &SnapshotConfig,
     process_options: &ProcessOptions,
     accounts_update_notifier: Option<AccountsUpdateNotifier>,
-) -> (BankForks, Option<StartingSnapshotHashes>) {
+    exit: &Arc<AtomicBool>,
+) -> (Arc<RwLock<BankForks>>, Option<StartingSnapshotHashes>) {
     // Fail hard here if snapshot fails to load, don't silently continue
     if account_paths.is_empty() {
         error!("Account paths not present when booting from snapshot");
@@ -187,11 +202,15 @@ fn bank_forks_from_snapshot(
     let (deserialized_bank, full_snapshot_archive_info, incremental_snapshot_archive_info) =
         snapshot_utils::bank_from_latest_snapshot_archives(
             &snapshot_config.bank_snapshots_dir,
-            &snapshot_config.snapshot_archives_dir,
+            &snapshot_config.full_snapshot_archives_dir,
+            &snapshot_config.incremental_snapshot_archives_dir,
             &account_paths,
             genesis_config,
+            &process_options.runtime_config,
             process_options.debug_keys.clone(),
-            Some(&crate::builtins::get(process_options.bpf_jit)),
+            Some(&crate::builtins::get(
+                process_options.runtime_config.bpf_jit,
+            )),
             process_options.account_indexes.clone(),
             process_options.accounts_db_caching_enabled,
             process_options.limit_load_slot_count_from_snapshot,
@@ -201,6 +220,7 @@ fn bank_forks_from_snapshot(
             process_options.verify_index,
             process_options.accounts_db_config.clone(),
             accounts_update_notifier,
+            exit,
         )
         .expect("Load from snapshot failed");
 
@@ -230,7 +250,7 @@ fn bank_forks_from_snapshot(
     };
 
     (
-        BankForks::new(deserialized_bank),
+        Arc::new(RwLock::new(BankForks::new(deserialized_bank))),
         Some(starting_snapshot_hashes),
     )
 }

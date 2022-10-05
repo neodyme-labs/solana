@@ -23,7 +23,7 @@
 //! Two important fields of `Config` are
 //!
 //! - [`json_rpc_url`], the URL to pass to
-//!   `solana_client::rpc_client::RpcClient`.
+//!   `solana_rpc_client::rpc_client::RpcClient`.
 //! - [`keypair_path`], a signing source, which may be a keypair file, but
 //!   may also represent several other types of signers, as described in
 //!   the documentation for `solana_clap_utils::keypair::signer_from_path`.
@@ -55,11 +55,15 @@
 extern crate lazy_static;
 
 mod config;
-pub use config::{Config, CONFIG_FILE};
+mod config_input;
 use std::{
     fs::{create_dir_all, File},
     io::{self, Write},
     path::Path,
+};
+pub use {
+    config::{Config, CONFIG_FILE},
+    config_input::{ConfigInput, SettingType},
 };
 
 /// Load a value from a file in YAML format.

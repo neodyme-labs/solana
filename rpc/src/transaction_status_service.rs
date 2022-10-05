@@ -6,9 +6,7 @@ use {
         blockstore::Blockstore,
         blockstore_processor::{TransactionStatusBatch, TransactionStatusMessage},
     },
-    solana_runtime::bank::{
-        DurableNonceFee, TransactionExecutionDetails, TransactionExecutionResult,
-    },
+    solana_runtime::bank::{DurableNonceFee, TransactionExecutionDetails},
     solana_transaction_status::{
         extract_and_fmt_memos, InnerInstructions, Reward, TransactionStatusMeta,
     },
@@ -39,7 +37,7 @@ impl TransactionStatusService {
     ) -> Self {
         let exit = exit.clone();
         let thread_hdl = Builder::new()
-            .name("solana-transaction-status-writer".to_string())
+            .name("solTxStatusWrtr".to_string())
             .spawn(move || loop {
                 if exit.load(Ordering::Relaxed) {
                     break;
@@ -76,6 +74,7 @@ impl TransactionStatusService {
                 balances,
                 token_balances,
                 rent_debits,
+                transaction_indexes,
             }) => {
                 let slot = bank.slot();
                 for (
@@ -86,6 +85,7 @@ impl TransactionStatusService {
                     pre_token_balances,
                     post_token_balances,
                     rent_debits,
+                    transaction_index,
                 ) in izip!(
                     transactions,
                     execution_results,
@@ -94,14 +94,17 @@ impl TransactionStatusService {
                     token_balances.pre_token_balances,
                     token_balances.post_token_balances,
                     rent_debits,
+                    transaction_indexes,
                 ) {
-                    if let TransactionExecutionResult::Executed(details) = execution_result {
+                    if let Some(details) = execution_result {
                         let TransactionExecutionDetails {
                             status,
                             log_messages,
                             inner_instructions,
                             durable_nonce_fee,
                             return_data,
+                            executed_units,
+                            ..
                         } = details;
                         let lamports_per_signature = match durable_nonce_fee {
                             Some(DurableNonceFee::Valid(lamports_per_signature)) => {
@@ -158,11 +161,13 @@ impl TransactionStatusService {
                             rewards,
                             loaded_addresses,
                             return_data,
+                            compute_units_consumed: Some(executed_units),
                         };
 
                         if let Some(transaction_notifier) = transaction_notifier.as_ref() {
                             transaction_notifier.write().unwrap().notify_transaction(
                                 slot,
+                                transaction_index,
                                 transaction.signature(),
                                 &transaction_status_meta,
                                 &transaction,
@@ -223,8 +228,9 @@ pub(crate) mod tests {
             clock::Slot,
             hash::Hash,
             instruction::CompiledInstruction,
-            message::{Message, MessageHeader, SanitizedMessage},
-            nonce, nonce_account,
+            message::{LegacyMessage, Message, MessageHeader, SanitizedMessage},
+            nonce::{self, state::DurableNonce},
+            nonce_account,
             pubkey::Pubkey,
             signature::{Keypair, Signature, Signer},
             system_transaction,
@@ -247,8 +253,20 @@ pub(crate) mod tests {
         },
     };
 
+    #[derive(Eq, Hash, PartialEq)]
+    struct TestNotifierKey {
+        slot: Slot,
+        transaction_index: usize,
+        signature: Signature,
+    }
+
+    struct TestNotification {
+        _meta: TransactionStatusMeta,
+        transaction: SanitizedTransaction,
+    }
+
     struct TestTransactionNotifier {
-        notifications: DashMap<(Slot, Signature), (TransactionStatusMeta, SanitizedTransaction)>,
+        notifications: DashMap<TestNotifierKey, TestNotification>,
     }
 
     impl TestTransactionNotifier {
@@ -263,13 +281,21 @@ pub(crate) mod tests {
         fn notify_transaction(
             &self,
             slot: Slot,
+            transaction_index: usize,
             signature: &Signature,
             transaction_status_meta: &TransactionStatusMeta,
             transaction: &SanitizedTransaction,
         ) {
             self.notifications.insert(
-                (slot, *signature),
-                (transaction_status_meta.clone(), transaction.clone()),
+                TestNotifierKey {
+                    slot,
+                    transaction_index,
+                    signature: *signature,
+                },
+                TestNotification {
+                    _meta: transaction_status_meta.clone(),
+                    transaction: transaction.clone(),
+                },
             );
         }
     }
@@ -316,6 +342,7 @@ pub(crate) mod tests {
             MessageHash::Compute,
             None,
             SimpleAddressLoader::Disabled,
+            true, // require_static_program_ids
         )
         .unwrap();
 
@@ -323,11 +350,12 @@ pub(crate) mod tests {
         let pubkey = Pubkey::new_unique();
 
         let mut nonce_account = nonce_account::create_account(1).into_inner();
-        let data = nonce::state::Data::new(Pubkey::new(&[1u8; 32]), Hash::new(&[42u8; 32]), 42);
+        let durable_nonce = DurableNonce::from_blockhash(&Hash::new(&[42u8; 32]));
+        let data = nonce::state::Data::new(Pubkey::new(&[1u8; 32]), durable_nonce, 42);
         nonce_account
-            .set_state(&nonce::state::Versions::new_current(
-                nonce::State::Initialized(data),
-            ))
+            .set_state(&nonce::state::Versions::new(nonce::State::Initialized(
+                data,
+            )))
             .unwrap();
 
         let message = build_message();
@@ -337,22 +365,23 @@ pub(crate) mod tests {
         let mut rent_debits = RentDebits::default();
         rent_debits.insert(&pubkey, 123, 456);
 
-        let transaction_result =
-            TransactionExecutionResult::Executed(TransactionExecutionDetails {
-                status: Ok(()),
-                log_messages: None,
-                inner_instructions: None,
-                durable_nonce_fee: Some(DurableNonceFee::from(
-                    &NonceFull::from_partial(
-                        rollback_partial,
-                        &SanitizedMessage::Legacy(message),
-                        &[(pubkey, nonce_account)],
-                        &rent_debits,
-                    )
-                    .unwrap(),
-                )),
-                return_data: None,
-            });
+        let transaction_result = Some(TransactionExecutionDetails {
+            status: Ok(()),
+            log_messages: None,
+            inner_instructions: None,
+            durable_nonce_fee: Some(DurableNonceFee::from(
+                &NonceFull::from_partial(
+                    rollback_partial,
+                    &SanitizedMessage::Legacy(LegacyMessage::new(message)),
+                    &[(pubkey, nonce_account)],
+                    &rent_debits,
+                )
+                .unwrap(),
+            )),
+            return_data: None,
+            executed_units: 0,
+            accounts_data_len_delta: 0,
+        });
 
         let balances = TransactionBalancesSet {
             pre_balances: vec![vec![123456]],
@@ -360,11 +389,13 @@ pub(crate) mod tests {
         };
 
         let owner = Pubkey::new_unique().to_string();
+        let token_program_id = Pubkey::new_unique().to_string();
         let pre_token_balance = TransactionTokenBalance {
             account_index: 0,
             mint: Pubkey::new_unique().to_string(),
             ui_token_amount: token_amount_to_ui_amount(42, 2),
             owner: owner.clone(),
+            program_id: token_program_id.clone(),
         };
 
         let post_token_balance = TransactionTokenBalance {
@@ -372,6 +403,7 @@ pub(crate) mod tests {
             mint: Pubkey::new_unique().to_string(),
             ui_token_amount: token_amount_to_ui_amount(58, 2),
             owner,
+            program_id: token_program_id,
         };
 
         let token_balances = TransactionTokenBalancesSet {
@@ -381,6 +413,7 @@ pub(crate) mod tests {
 
         let slot = bank.slot();
         let signature = *transaction.signature();
+        let transaction_index: usize = bank.transaction_count().try_into().unwrap();
         let transaction_status_batch = TransactionStatusBatch {
             bank,
             transactions: vec![transaction],
@@ -388,6 +421,7 @@ pub(crate) mod tests {
             balances,
             token_balances,
             rent_debits: vec![rent_debits],
+            transaction_indexes: vec![transaction_index],
         };
 
         let test_notifier = Arc::new(RwLock::new(TestTransactionNotifier::new()));
@@ -412,9 +446,17 @@ pub(crate) mod tests {
         transaction_status_service.join().unwrap();
         let notifier = test_notifier.read().unwrap();
         assert_eq!(notifier.notifications.len(), 1);
-        assert!(notifier.notifications.contains_key(&(slot, signature)));
+        let key = TestNotifierKey {
+            slot,
+            transaction_index,
+            signature,
+        };
+        assert!(notifier.notifications.contains_key(&key));
 
-        let result = &*notifier.notifications.get(&(slot, signature)).unwrap();
-        assert_eq!(expected_transaction.signature(), result.1.signature());
+        let result = &*notifier.notifications.get(&key).unwrap();
+        assert_eq!(
+            expected_transaction.signature(),
+            result.transaction.signature()
+        );
     }
 }

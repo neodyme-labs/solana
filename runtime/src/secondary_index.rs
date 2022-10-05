@@ -1,5 +1,6 @@
 use {
     dashmap::{mapref::entry::Entry::Occupied, DashMap},
+    log::*,
     solana_sdk::{pubkey::Pubkey, timing::AtomicInterval},
     std::{
         collections::HashSet,
@@ -119,12 +120,10 @@ impl<SecondaryIndexEntryType: SecondaryIndexEntry + Default + Sync + Send>
 
     pub fn insert(&self, key: &Pubkey, inner_key: &Pubkey) {
         {
-            let pubkeys_map = self.index.get(key).unwrap_or_else(|| {
-                self.index
-                    .entry(*key)
-                    .or_insert(SecondaryIndexEntryType::default())
-                    .downgrade()
-            });
+            let pubkeys_map = self
+                .index
+                .get(key)
+                .unwrap_or_else(|| self.index.entry(*key).or_default().downgrade());
 
             pubkeys_map.insert_if_not_exists(inner_key, &self.stats.num_inner_keys);
         }
@@ -222,5 +221,20 @@ impl<SecondaryIndexEntryType: SecondaryIndexEntry + Default + Sync + Send>
         } else {
             vec![]
         }
+    }
+
+    /// log top 20 (owner, # accounts) in descending order of # accounts
+    pub fn log_contents(&self) {
+        let mut entries = self
+            .index
+            .iter()
+            .map(|entry| (entry.value().len(), *entry.key()))
+            .collect::<Vec<_>>();
+        entries.sort_unstable();
+        entries
+            .iter()
+            .rev()
+            .take(20)
+            .for_each(|(v, k)| info!("owner: {}, accounts: {}", k, v));
     }
 }

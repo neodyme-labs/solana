@@ -1,14 +1,18 @@
+//! Calculation of transaction fees.
+
 #![allow(clippy::integer_arithmetic)]
 use {
     crate::{clock::DEFAULT_MS_PER_SLOT, ed25519_program, message::Message, secp256k1_program},
     log::*,
 };
 
-#[derive(Serialize, Deserialize, Default, PartialEq, Eq, Clone, Debug, AbiExample)]
+#[derive(Serialize, Deserialize, Default, PartialEq, Eq, Clone, Copy, Debug, AbiExample)]
 #[serde(rename_all = "camelCase")]
 pub struct FeeCalculator {
-    // The current cost of a signature  This amount may increase/decrease over time based on
-    // cluster processing load.
+    /// The current cost of a signature.
+    ///
+    /// This amount may increase/decrease over time based on cluster processing
+    /// load.
     pub lamports_per_signature: u64,
 }
 
@@ -159,6 +163,13 @@ impl FeeRateGovernor {
             me.lamports_per_signature
         );
         me
+    }
+
+    pub fn clone_with_lamports_per_signature(&self, lamports_per_signature: u64) -> Self {
+        Self {
+            lamports_per_signature,
+            ..*self
+        }
     }
 
     /// calculate unburned fee from a fee total, returns (unburned, burned)

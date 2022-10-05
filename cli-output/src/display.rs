@@ -3,6 +3,7 @@ use {
     chrono::{DateTime, Local, NaiveDateTime, SecondsFormat, TimeZone, Utc},
     console::style,
     indicatif::{ProgressBar, ProgressStyle},
+    solana_cli_config::SettingType,
     solana_sdk::{
         clock::UnixTimestamp,
         hash::Hash,
@@ -14,11 +15,12 @@ use {
         signature::Signature,
         stake,
         transaction::{TransactionError, TransactionVersion, VersionedTransaction},
-        transaction_context::TransactionReturnData,
     },
-    solana_transaction_status::{Rewards, UiTransactionStatusMeta},
+    solana_transaction_status::{
+        Rewards, UiReturnDataEncoding, UiTransactionReturnData, UiTransactionStatusMeta,
+    },
     spl_memo::{id as spl_memo_id, v1::id as spl_memo_v1_id},
-    std::{collections::HashMap, fmt, io},
+    std::{collections::HashMap, fmt, io, time::Duration},
 };
 
 #[derive(Clone, Debug)]
@@ -102,6 +104,21 @@ pub fn writeln_name_value(f: &mut dyn fmt::Write, name: &str, value: &str) -> fm
         style(value)
     };
     writeln!(f, "{} {}", style(name).bold(), styled_value)
+}
+
+pub fn println_name_value_or(name: &str, value: &str, setting_type: SettingType) {
+    let description = match setting_type {
+        SettingType::Explicit => "",
+        SettingType::Computed => "(computed)",
+        SettingType::SystemDefault => "(default)",
+    };
+
+    println!(
+        "{} {} {}",
+        style(name).bold(),
+        style(value),
+        style(description).italic(),
+    );
 }
 
 pub fn format_labeled_address(pubkey: &str, address_labels: &HashMap<String, String>) -> String {
@@ -246,9 +263,14 @@ fn write_transaction<W: io::Write>(
         write_status(w, &transaction_status.status, prefix)?;
         write_fees(w, transaction_status.fee, prefix)?;
         write_balances(w, transaction_status, prefix)?;
-        write_log_messages(w, transaction_status.log_messages.as_ref(), prefix)?;
-        write_return_data(w, transaction_status.return_data.as_ref(), prefix)?;
-        write_rewards(w, transaction_status.rewards.as_ref(), prefix)?;
+        write_compute_units_consumed(
+            w,
+            transaction_status.compute_units_consumed.clone().into(),
+            prefix,
+        )?;
+        write_log_messages(w, transaction_status.log_messages.as_ref().into(), prefix)?;
+        write_return_data(w, transaction_status.return_data.as_ref().into(), prefix)?;
+        write_rewards(w, transaction_status.rewards.as_ref().into(), prefix)?;
     } else {
         writeln!(w, "{}Status: Unavailable", prefix)?;
     }
@@ -354,7 +376,7 @@ fn write_signatures<W: io::Write>(
     Ok(())
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AccountKeyType<'a> {
     Known(&'a Pubkey),
     Unknown {
@@ -512,7 +534,7 @@ fn write_rewards<W: io::Write>(
                         "-".to_string()
                     },
                     sign,
-                    lamports_to_sol(reward.lamports.abs() as u64),
+                    lamports_to_sol(reward.lamports.unsigned_abs()),
                     lamports_to_sol(reward.post_balance)
                 )?;
             }
@@ -580,19 +602,39 @@ fn write_balances<W: io::Write>(
 
 fn write_return_data<W: io::Write>(
     w: &mut W,
-    return_data: Option<&TransactionReturnData>,
+    return_data: Option<&UiTransactionReturnData>,
     prefix: &str,
 ) -> io::Result<()> {
     if let Some(return_data) = return_data {
-        if !return_data.data.is_empty() {
+        let (data, encoding) = &return_data.data;
+        let raw_return_data = match encoding {
+            UiReturnDataEncoding::Base64 => base64::decode(data).map_err(|err| {
+                io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("could not parse data as {:?}: {:?}", encoding, err),
+                )
+            })?,
+        };
+        if !raw_return_data.is_empty() {
             use pretty_hex::*;
             writeln!(
                 w,
                 "{}Return Data from Program {}:",
                 prefix, return_data.program_id
             )?;
-            writeln!(w, "{}  {:?}", prefix, return_data.data.hex_dump())?;
+            writeln!(w, "{}  {:?}", prefix, raw_return_data.hex_dump())?;
         }
+    }
+    Ok(())
+}
+
+fn write_compute_units_consumed<W: io::Write>(
+    w: &mut W,
+    compute_units_consumed: Option<u64>,
+    prefix: &str,
+) -> io::Result<()> {
+    if let Some(cus) = compute_units_consumed {
+        writeln!(w, "{}Compute Units Consumed: {}", prefix, cus)?;
     }
     Ok(())
 }
@@ -668,9 +710,12 @@ pub fn writeln_transaction(
 /// Creates a new process bar for processing that will take an unknown amount of time
 pub fn new_spinner_progress_bar() -> ProgressBar {
     let progress_bar = ProgressBar::new(42);
-    progress_bar
-        .set_style(ProgressStyle::default_spinner().template("{spinner:.green} {wide_msg}"));
-    progress_bar.enable_steady_tick(100);
+    progress_bar.set_style(
+        ProgressStyle::default_spinner()
+            .template("{spinner:.green} {wide_msg}")
+            .expect("ProgresStyle::template direct input to be correct"),
+    );
+    progress_bar.enable_steady_tick(Duration::from_millis(100));
     progress_bar
 }
 
@@ -693,6 +738,7 @@ mod test {
             pubkey::Pubkey,
             signature::{Keypair, Signer},
             transaction::Transaction,
+            transaction_context::TransactionReturnData,
         },
         solana_transaction_status::{Reward, RewardType, TransactionStatusMeta},
         std::io::BufWriter,
@@ -775,6 +821,7 @@ mod test {
                 program_id: Pubkey::new_from_array([2u8; 32]),
                 data: vec![1, 2, 3],
             }),
+            compute_units_consumed: Some(1234u64),
         };
 
         let output = {
@@ -809,6 +856,7 @@ Status: Ok
   Fee: ◎0.000005
   Account 0 balance: ◎0.000005 -> ◎0
   Account 1 balance: ◎0.00001 -> ◎0.0000099
+Compute Units Consumed: 1234
 Log Messages:
   Test message
 Return Data from Program 8qbHbw2BbbTHBW1sbeqakYXVKRQM8Ne7pLK7m6CVfeR:
@@ -852,6 +900,7 @@ Rewards:
                 program_id: Pubkey::new_from_array([2u8; 32]),
                 data: vec![1, 2, 3],
             }),
+            compute_units_consumed: Some(2345u64),
         };
 
         let output = {
@@ -895,6 +944,7 @@ Status: Ok
   Account 1 balance: ◎0.00001
   Account 2 balance: ◎0.000015 -> ◎0.0000149
   Account 3 balance: ◎0.00002
+Compute Units Consumed: 2345
 Log Messages:
   Test message
 Return Data from Program 8qbHbw2BbbTHBW1sbeqakYXVKRQM8Ne7pLK7m6CVfeR:

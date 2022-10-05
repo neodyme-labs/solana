@@ -7,6 +7,7 @@
 use {
     crate::{
         cluster_info::Ping,
+        cluster_info_metrics::GossipStats,
         contact_info::ContactInfo,
         crds::{Crds, GossipRoute},
         crds_gossip_error::CrdsGossipError,
@@ -216,7 +217,7 @@ impl CrdsGossip {
         ping_cache: &Mutex<PingCache>,
         pings: &mut Vec<(SocketAddr, Ping)>,
         socket_addr_space: &SocketAddrSpace,
-    ) -> Result<(ContactInfo, Vec<CrdsFilter>), CrdsGossipError> {
+    ) -> Result<HashMap<ContactInfo, Vec<CrdsFilter>>, CrdsGossipError> {
         self.pull.new_pull_request(
             thread_pool,
             &self.crds,
@@ -254,6 +255,7 @@ impl CrdsGossip {
         filters: &[(CrdsValue, CrdsFilter)],
         output_size_limit: usize, // Limit number of crds values returned.
         now: u64,
+        stats: &GossipStats,
     ) -> Vec<Vec<CrdsValue>> {
         CrdsGossipPull::generate_pull_responses(
             thread_pool,
@@ -261,6 +263,7 @@ impl CrdsGossip {
             filters,
             output_size_limit,
             now,
+            stats,
         )
     }
 

@@ -1,46 +1,60 @@
-import React from "react";
 import { PublicKey } from "@solana/web3.js";
-import { CacheEntry, FetchStatus } from "providers/cache";
-import {
-  useFetchAccountInfo,
-  useAccountInfo,
-  Account,
-  ProgramData,
-  TokenProgramData,
-  useMintAccountInfo,
-} from "providers/accounts";
-import { StakeAccountSection } from "components/account/StakeAccountSection";
-import { TokenAccountSection } from "components/account/TokenAccountSection";
-import { ErrorCard } from "components/common/ErrorCard";
-import { LoadingCard } from "components/common/LoadingCard";
-import { useCluster, ClusterStatus } from "providers/cluster";
-import { NavLink, Redirect, useLocation } from "react-router-dom";
-import { clusterPath } from "utils/url";
-import { UnknownAccountCard } from "components/account/UnknownAccountCard";
-import { OwnedTokensCard } from "components/account/OwnedTokensCard";
-import { TokenHistoryCard } from "components/account/TokenHistoryCard";
-import { TokenLargestAccountsCard } from "components/account/TokenLargestAccountsCard";
-import { VoteAccountSection } from "components/account/VoteAccountSection";
-import { NonceAccountSection } from "components/account/NonceAccountSection";
-import { VotesCard } from "components/account/VotesCard";
-import { SysvarAccountSection } from "components/account/SysvarAccountSection";
-import { SlotHashesCard } from "components/account/SlotHashesCard";
-import { StakeHistoryCard } from "components/account/StakeHistoryCard";
+import { AnchorAccountCard } from "components/account/AnchorAccountCard";
+import { AnchorProgramCard } from "components/account/AnchorProgramCard";
 import { BlockhashesCard } from "components/account/BlockhashesCard";
 import { ConfigAccountSection } from "components/account/ConfigAccountSection";
-import { useFlaggedAccounts } from "providers/accounts/flagged-accounts";
-import { UpgradeableLoaderAccountSection } from "components/account/UpgradeableLoaderAccountSection";
-import { useTokenRegistry } from "providers/mints/token-registry";
-import { Identicon } from "components/common/Identicon";
-import { TransactionHistoryCard } from "components/account/history/TransactionHistoryCard";
-import { TokenTransfersCard } from "components/account/history/TokenTransfersCard";
-import { TokenInstructionsCard } from "components/account/history/TokenInstructionsCard";
-import { RewardsCard } from "components/account/RewardsCard";
-import { MetaplexMetadataCard } from "components/account/MetaplexMetadataCard";
-import { NFTHeader } from "components/account/MetaplexNFTHeader";
 import { DomainsCard } from "components/account/DomainsCard";
-import isMetaplexNFT from "providers/accounts/utils/isMetaplexNFT";
+import { TokenInstructionsCard } from "components/account/history/TokenInstructionsCard";
+import { TokenTransfersCard } from "components/account/history/TokenTransfersCard";
+import { TransactionHistoryCard } from "components/account/history/TransactionHistoryCard";
+import { MetaplexMetadataCard } from "components/account/MetaplexMetadataCard";
+import { MetaplexNFTAttributesCard } from "components/account/MetaplexNFTAttributesCard";
+import { MetaplexNFTHeader } from "components/account/MetaplexNFTHeader";
+import { NonceAccountSection } from "components/account/NonceAccountSection";
+import { OwnedTokensCard } from "components/account/OwnedTokensCard";
+import { RewardsCard } from "components/account/RewardsCard";
 import { SecurityCard } from "components/account/SecurityCard";
+import { SlotHashesCard } from "components/account/SlotHashesCard";
+import { StakeAccountSection } from "components/account/StakeAccountSection";
+import { StakeHistoryCard } from "components/account/StakeHistoryCard";
+import { SysvarAccountSection } from "components/account/SysvarAccountSection";
+import { TokenAccountSection } from "components/account/TokenAccountSection";
+import { TokenHistoryCard } from "components/account/TokenHistoryCard";
+import { TokenLargestAccountsCard } from "components/account/TokenLargestAccountsCard";
+import { UnknownAccountCard } from "components/account/UnknownAccountCard";
+import { UpgradeableLoaderAccountSection } from "components/account/UpgradeableLoaderAccountSection";
+import { VoteAccountSection } from "components/account/VoteAccountSection";
+import { VotesCard } from "components/account/VotesCard";
+import { ErrorCard } from "components/common/ErrorCard";
+import { Identicon } from "components/common/Identicon";
+import { LoadingCard } from "components/common/LoadingCard";
+import {
+  Account,
+  TokenProgramData,
+  useAccountInfo,
+  useFetchAccountInfo,
+  useMintAccountInfo,
+} from "providers/accounts";
+import { useFlaggedAccounts } from "providers/accounts/flagged-accounts";
+import isMetaplexNFT from "providers/accounts/utils/isMetaplexNFT";
+import { useAnchorProgram } from "providers/anchor";
+import { CacheEntry, FetchStatus } from "providers/cache";
+import { ClusterStatus, useCluster } from "providers/cluster";
+import { useTokenRegistry } from "providers/mints/token-registry";
+import React, { Suspense } from "react";
+import { NavLink, Redirect, useLocation } from "react-router-dom";
+import { clusterPath } from "utils/url";
+import { NFTokenAccountHeader } from "../components/account/nftoken/NFTokenAccountHeader";
+import { NFTokenAccountSection } from "../components/account/nftoken/NFTokenAccountSection";
+import { NFTokenCollectionNFTGrid } from "../components/account/nftoken/NFTokenCollectionNFTGrid";
+import { NFTOKEN_ADDRESS } from "../components/account/nftoken/nftoken";
+import {
+  isNFTokenAccount,
+  parseNFTokenCollectionAccount,
+} from "../components/account/nftoken/isNFTokenAccount";
+import { isAddressLookupTableAccount } from "components/account/address-lookup-table/types";
+import { AddressLookupTableAccountSection } from "components/account/address-lookup-table/AddressLookupTableAccountSection";
+import { LookupTableEntriesCard } from "components/account/address-lookup-table/LookupTableEntriesCard";
 
 const IDENTICON_WIDTH = 64;
 
@@ -67,6 +81,11 @@ const TABS_LOOKUP: { [id: string]: Tab[] } = {
       slug: "metadata",
       title: "Metadata",
       path: "/metadata",
+    },
+    {
+      slug: "attributes",
+      title: "Attributes",
+      path: "/attributes",
     },
   ],
   stake: [
@@ -114,6 +133,20 @@ const TABS_LOOKUP: { [id: string]: Tab[] } = {
       slug: "security",
       title: "Security",
       path: "/security",
+    },
+  ],
+  "nftoken:collection": [
+    {
+      slug: "nftoken-collection-nfts",
+      title: "NFTs",
+      path: "/nfts",
+    },
+  ],
+  "address-lookup-table": [
+    {
+      slug: "entries",
+      title: "Table Entries",
+      path: "/entries",
     },
   ],
 };
@@ -176,21 +209,49 @@ export function AccountHeader({
 
   if (isMetaplexNFT(data, mintInfo)) {
     return (
-      <NFTHeader
+      <MetaplexNFTHeader
         nftData={(data as TokenProgramData).nftData!}
         address={address}
       />
     );
   }
 
-  if (tokenDetails && isToken) {
+  const nftokenNFT = account && isNFTokenAccount(account);
+  if (nftokenNFT && account) {
+    return <NFTokenAccountHeader account={account} />;
+  }
+
+  if (isToken) {
+    let token;
+    let unverified = false;
+
+    // Fall back to legacy token list when there is stub metadata (blank uri), updatable by default by the mint authority
+    if (!data?.nftData?.metadata.data.uri && tokenDetails) {
+      token = tokenDetails;
+    } else if (data?.nftData) {
+      token = {
+        logoURI: data?.nftData?.json?.image,
+        name: data?.nftData?.json?.name ?? data?.nftData.metadata.data.name,
+      };
+      unverified = true;
+    } else if (tokenDetails) {
+      token = tokenDetails;
+    }
+
     return (
       <div className="row align-items-end">
+        {unverified && (
+          <div className="alert alert-warning alert-scam" role="alert">
+            Warning! Token names and logos are not unique. This token may have
+            spoofed its name and logo to look like another token. Verify the
+            token's mint address to ensure it is correct.
+          </div>
+        )}
         <div className="col-auto">
           <div className="avatar avatar-lg header-avatar-top">
-            {tokenDetails?.logoURI ? (
+            {token?.logoURI ? (
               <img
-                src={tokenDetails.logoURI}
+                src={token.logoURI}
                 alt="token logo"
                 className="avatar-img rounded-circle border border-4 border-body"
               />
@@ -206,9 +267,7 @@ export function AccountHeader({
 
         <div className="col mb-3 ms-n3 ms-md-n2">
           <h6 className="header-pretitle">Token</h6>
-          <h2 className="header-title">
-            {tokenDetails?.name || "Unknown Token"}
-          </h2>
+          <h2 className="header-title">{token?.name || "Unknown Token"}</h2>
         </div>
       </div>
     );
@@ -246,11 +305,16 @@ function DetailsSections({
   }
 
   const account = info.data;
-  const data = account?.details?.data;
-  const tabs = getTabs(data);
+  const tabComponents = getTabs(pubkey, account).concat(
+    getAnchorTabs(pubkey, account)
+  );
 
   let moreTab: MoreTabs = "history";
-  if (tab && tabs.filter(({ slug }) => slug === tab).length === 0) {
+  if (
+    tab &&
+    tabComponents.filter((tabComponent) => tabComponent.tab.slug === tab)
+      .length === 0
+  ) {
     return <Redirect to={{ ...location, pathname: `/address/${address}` }} />;
   } else if (tab) {
     moreTab = tab as MoreTabs;
@@ -264,14 +328,19 @@ function DetailsSections({
           account. Please be cautious sending SOL to this account.
         </div>
       )}
-      {<InfoSection account={account} />}
-      {<MoreSection account={account} tab={moreTab} tabs={tabs} />}
+      <InfoSection account={account} />
+      <MoreSection
+        account={account}
+        tab={moreTab}
+        tabs={tabComponents.map(({ component }) => component)}
+      />
     </>
   );
 }
 
 function InfoSection({ account }: { account: Account }) {
-  const data = account?.details?.data;
+  const details = account?.details;
+  const data = details?.data;
 
   if (data && data.program === "bpf-upgradeable-loader") {
     return (
@@ -290,6 +359,8 @@ function InfoSection({ account }: { account: Account }) {
         stakeAccountType={data.parsed.type}
       />
     );
+  } else if (account.details?.owner.toBase58() === NFTOKEN_ADDRESS) {
+    return <NFTokenAccountSection account={account} />;
   } else if (data && data.program === "spl-token") {
     return <TokenAccountSection account={account} tokenAccount={data.parsed} />;
   } else if (data && data.program === "nonce") {
@@ -304,6 +375,27 @@ function InfoSection({ account }: { account: Account }) {
     return (
       <ConfigAccountSection account={account} configAccount={data.parsed} />
     );
+  } else if (
+    data &&
+    data.program === "address-lookup-table" &&
+    data.parsed.type === "lookupTable"
+  ) {
+    return (
+      <AddressLookupTableAccountSection
+        account={account}
+        lookupTableAccount={data.parsed.info}
+      />
+    );
+  } else if (
+    details?.rawData &&
+    isAddressLookupTableAccount(details.owner, details.rawData)
+  ) {
+    return (
+      <AddressLookupTableAccountSection
+        account={account}
+        data={details.rawData}
+      />
+    );
   } else {
     return <UnknownAccountCard account={account} />;
   }
@@ -315,9 +407,15 @@ type Tab = {
   path: string;
 };
 
+type TabComponent = {
+  tab: Tab;
+  component: JSX.Element | null;
+};
+
 export type MoreTabs =
   | "history"
   | "tokens"
+  | "nftoken-collection-nfts"
   | "largest"
   | "vote-history"
   | "slot-hashes"
@@ -327,8 +425,12 @@ export type MoreTabs =
   | "instructions"
   | "rewards"
   | "metadata"
+  | "attributes"
   | "domains"
-  | "security";
+  | "security"
+  | "anchor-program"
+  | "anchor-account"
+  | "entries";
 
 function MoreSection({
   account,
@@ -337,29 +439,18 @@ function MoreSection({
 }: {
   account: Account;
   tab: MoreTabs;
-  tabs: Tab[];
+  tabs: (JSX.Element | null)[];
 }) {
   const pubkey = account.pubkey;
-  const address = account.pubkey.toBase58();
-  const data = account?.details?.data;
+  const details = account?.details;
+  const data = details?.data;
+
   return (
     <>
       <div className="container">
         <div className="header">
           <div className="header-body pt-0">
-            <ul className="nav nav-tabs nav-overflow header-tabs">
-              {tabs.map(({ title, slug, path }) => (
-                <li key={slug} className="nav-item">
-                  <NavLink
-                    className="nav-link"
-                    to={clusterPath(`/address/${address}${path}`)}
-                    exact
-                  >
-                    {title}
-                  </NavLink>
-                </li>
-              ))}
-            </ul>
+            <ul className="nav nav-tabs nav-overflow header-tabs">{tabs}</ul>
           </div>
         </div>
       </div>
@@ -397,15 +488,55 @@ function MoreSection({
           nftData={(account.details?.data as TokenProgramData).nftData!}
         />
       )}
+      {tab === "nftoken-collection-nfts" && (
+        <Suspense
+          fallback={<LoadingCard message="Loading NFTs for collection." />}
+        >
+          <NFTokenCollectionNFTGrid collection={account.pubkey.toBase58()} />
+        </Suspense>
+      )}
+      {tab === "attributes" && (
+        <MetaplexNFTAttributesCard
+          nftData={(account.details?.data as TokenProgramData).nftData!}
+        />
+      )}
       {tab === "domains" && <DomainsCard pubkey={pubkey} />}
       {tab === "security" && data?.program === "bpf-upgradeable-loader" && (
         <SecurityCard data={data} />
       )}
+      {tab === "anchor-program" && (
+        <React.Suspense
+          fallback={<LoadingCard message="Loading anchor program IDL" />}
+        >
+          <AnchorProgramCard programId={pubkey} />
+        </React.Suspense>
+      )}
+      {tab === "anchor-account" && (
+        <React.Suspense
+          fallback={
+            <LoadingCard message="Decoding account data using anchor interface" />
+          }
+        >
+          <AnchorAccountCard account={account} />
+        </React.Suspense>
+      )}
+      {tab === "entries" &&
+        details?.rawData &&
+        isAddressLookupTableAccount(details.owner, details.rawData) && (
+          <LookupTableEntriesCard lookupTableAccountData={details?.rawData} />
+        )}
+      {tab === "entries" &&
+        data?.program === "address-lookup-table" &&
+        data.parsed.type === "lookupTable" && (
+          <LookupTableEntriesCard parsedLookupTable={data.parsed.info} />
+        )}
     </>
   );
 }
 
-function getTabs(data?: ProgramData): Tab[] {
+function getTabs(pubkey: PublicKey, account: Account): TabComponent[] {
+  const address = pubkey.toBase58();
+  const data = account.details?.data;
   const tabs: Tab[] = [
     {
       slug: "history",
@@ -427,6 +558,14 @@ function getTabs(data?: ProgramData): Tab[] {
     tabs.push(...TABS_LOOKUP[programTypeKey]);
   }
 
+  // Add the key for address lookup tables
+  if (
+    account.details?.rawData &&
+    isAddressLookupTableAccount(account.details.owner, account.details.rawData)
+  ) {
+    tabs.push(...TABS_LOOKUP["address-lookup-table"]);
+  }
+
   // Add the key for Metaplex NFTs
   if (
     data &&
@@ -436,12 +575,25 @@ function getTabs(data?: ProgramData): Tab[] {
     tabs.push(...TABS_LOOKUP[`${programTypeKey}:metaplexNFT`]);
   }
 
+  const isNFToken = account && isNFTokenAccount(account);
+  if (isNFToken) {
+    const collection = parseNFTokenCollectionAccount(account);
+    if (collection) {
+      tabs.push({
+        slug: "nftoken-collection-nfts",
+        title: "NFTs",
+        path: "/nftoken-collection-nfts",
+      });
+    }
+  }
+
   if (
-    !data ||
-    !(
-      TOKEN_TABS_HIDDEN.includes(data.program) ||
-      TOKEN_TABS_HIDDEN.includes(programTypeKey)
-    )
+    !isNFToken &&
+    (!data ||
+      !(
+        TOKEN_TABS_HIDDEN.includes(data.program) ||
+        TOKEN_TABS_HIDDEN.includes(programTypeKey)
+      ))
   ) {
     tabs.push({
       slug: "tokens",
@@ -455,5 +607,122 @@ function getTabs(data?: ProgramData): Tab[] {
     });
   }
 
-  return tabs;
+  return tabs.map((tab) => {
+    return {
+      tab,
+      component: (
+        <li key={tab.slug} className="nav-item">
+          <NavLink
+            className="nav-link"
+            to={clusterPath(`/address/${address}${tab.path}`)}
+            exact
+          >
+            {tab.title}
+          </NavLink>
+        </li>
+      ),
+    };
+  });
+}
+
+function getAnchorTabs(pubkey: PublicKey, account: Account) {
+  const tabComponents = [];
+  const anchorProgramTab: Tab = {
+    slug: "anchor-program",
+    title: "Anchor Program IDL",
+    path: "/anchor-program",
+  };
+  tabComponents.push({
+    tab: anchorProgramTab,
+    component: (
+      <React.Suspense key={anchorProgramTab.slug} fallback={<></>}>
+        <AnchorProgramLink
+          tab={anchorProgramTab}
+          address={pubkey.toString()}
+          pubkey={pubkey}
+        />
+      </React.Suspense>
+    ),
+  });
+
+  const accountDataTab: Tab = {
+    slug: "anchor-account",
+    title: "Anchor Data",
+    path: "/anchor-account",
+  };
+  tabComponents.push({
+    tab: accountDataTab,
+    component: (
+      <React.Suspense key={accountDataTab.slug} fallback={<></>}>
+        <AccountDataLink
+          tab={accountDataTab}
+          address={pubkey.toString()}
+          programId={account.details?.owner}
+        />
+      </React.Suspense>
+    ),
+  });
+
+  return tabComponents;
+}
+
+function AnchorProgramLink({
+  tab,
+  address,
+  pubkey,
+}: {
+  tab: Tab;
+  address: string;
+  pubkey: PublicKey;
+}) {
+  const { url } = useCluster();
+  const anchorProgram = useAnchorProgram(pubkey.toString() ?? "", url);
+
+  if (!anchorProgram) {
+    return null;
+  }
+
+  return (
+    <li key={tab.slug} className="nav-item">
+      <NavLink
+        className="nav-link"
+        to={clusterPath(`/address/${address}${tab.path}`)}
+        exact
+      >
+        {tab.title}
+      </NavLink>
+    </li>
+  );
+}
+
+function AccountDataLink({
+  address,
+  tab,
+  programId,
+}: {
+  address: string;
+  tab: Tab;
+  programId: PublicKey | undefined;
+}) {
+  const { url } = useCluster();
+  const accountAnchorProgram = useAnchorProgram(
+    programId?.toString() ?? "",
+    url
+  );
+
+  if (!accountAnchorProgram) {
+    return null;
+  }
+
+  return (
+    <li key={tab.slug} className="nav-item">
+      <NavLink
+        className="nav-link"
+        to={clusterPath(`/address/${address}${tab.path}`)}
+        exact
+      >
+        {tab.title}
+      </NavLink>
+    </li>
+  );
 }
